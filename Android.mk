@@ -14,20 +14,36 @@
 # limitations under the License.
 #
 
-LOCAL_PATH:= $(call my-dir)
+LOCAL_PATH := $(call my-dir)
+ARCHIVE_NAME := hal-droid-wop-$(TARGET_DEVICE).tar
+ARCHIVE_NAME_COMPRESSED := hal-droid-wop-$(TARGET_DEVICE).tar.bz2
 
-.PHONY: luneos-hybris-hal luneos-hybris-common
+.PHONY: luneos-hybris-hal luneos-hybris-common luneos-hybris-camera
 
-luneos-hybris-common: bootimage \
-                      servicemanager \
+luneos-hybris-camera: luneos-hybris-common libcamera_compat_layer libis_compat_layer camera_service
+	# Deploy only the needed libs for camera
+	@mkdir -p $(PRODUCT_OUT)/overlay-libs && chmod 755 $(PRODUCT_OUT)/overlay-libs
+	@( cd $(PRODUCT_OUT) ; cp -v system/lib/{liblog.so,libcameraservice.so,libcamera_client.so,libmedia.so,libmediaplayerservice.so,libstagefright.so,libcamera_compat_layer.so,libmedia_compat_layer.so,libis_compat_layer.so} overlay-libs/ )
+	@( cd $(PRODUCT_OUT) ; bunzip2 $(ARCHIVE_NAME_COMPRESSED); tar rvf $(ARCHIVE_NAME) overlay-libs/ system/bin/camera_service system/lib/libcamera_compat_layer.so system/lib/libmedia_compat_layer.so system/lib/libis_compat_layer.so ; bzip2 $(ARCHIVE_NAME) )
+
+luneos-hybris-preliminary-cleanup:
+	# Cleanup generated libs and symbols
+	@rm -rf $(PRODUCT_OUT)/system/ $(PRODUCT_OUT)/symbols/
+
+luneos-hybris-common: luneos-hybris-preliminary-cleanup \
+		      bootimage \
+		      servicemanager \
 		      logcat updater init adb adbd linker \
 		      libc \
 		      libEGL libGLESv1_CM libGLESv2 \
-		      libcamera_compat_layer camera_service libis_compat_layer
+	# Pack together all the system stuff we need and deploy the target into a tar.bz2 archive
+	@( cd $(PRODUCT_OUT) ; cp `find obj -name filesystem_config.txt` $(PRODUCT_OUT) || touch filesystem_config.txt )
+	@( cd $(PRODUCT_OUT) ; cp ramdisk.img android-ramdisk.img )
+	@( cd $(PRODUCT_OUT) ; tar cvjf $(ARCHIVE_NAME_COMPRESSED) system symbols android-ramdisk.img filesystem_config.txt )
 
 ifeq ("$(TARGET_ARCH)", "arm64")
-luneos-hybris-hal: luneos-hybris-common linker_32 libc_32 libEGL_32 libGLESv1_CM_32 libGLESv2_32
+luneos-hybris-hal: luneos-hybris-common luneos-hybris-camera linker_32 libc_32 libEGL_32 libGLESv1_CM_32 libGLESv2_32
 else
-luneos-hybris-hal: luneos-hybris-common
+luneos-hybris-hal: luneos-hybris-common luneos-hybris-camera
 endif
 

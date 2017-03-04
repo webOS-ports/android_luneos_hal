@@ -1,0 +1,53 @@
+From a515d0f8672ca83c96c8d74ff5f550c7ccbf345c Mon Sep 17 00:00:00 2001
+From: Christophe Chapuis <chris.chapuis@gmail.com>
+Date: Sat, 4 Mar 2017 12:24:48 +0000
+Subject: [PATCH] luneos: add projects needed by camera_service
+
+Change-Id: I75d9dac94bf849e0b5100c3ce8e755b256950a4b
+---
+ core/main.mk | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/core/main.mk b/core/main.mk
+index cc07773..745f3e8 100644
+--- a/core/main.mk
++++ b/core/main.mk
+@@ -517,23 +517,26 @@ ifneq ($(dont_bother),true)
+ # Include all of the makefiles in the system
+ #
+ 
+-subdir_makefile_dirs := abi bionic bootable build device external hardware hybris libcore system
++subdir_makefile_dirs := abi bionic bootable build device external hardware hybris libcore system luneos ubuntu
+ 
+ # Can't use first-makefiles-under here because
+ # --mindepth=2 makes the prunes not work.
+ subdir_makefiles := \
+ ./frameworks/base/Android.mk \
++./frameworks/base/libs/input/Android.mk \
+ ./frameworks/native/cmds/dumpstate/Android.mk \
+ ./frameworks/native/cmds/dumpsys/Android.mk \
+ ./frameworks/native/libs/binder/Android.mk \
+ ./frameworks/native/libs/gui/Android.mk \
+ ./frameworks/native/libs/ui/Android.mk \
++./frameworks/native/libs/input/Android.mk \
+ ./frameworks/native/opengl/libagl/Android.mk \
+ ./frameworks/native/opengl/libs/Android.mk \
+ ./frameworks/native/services/powermanager/Android.mk \
+ ./frameworks/native/services/sensorservice/Android.mk \
+ ./frameworks/native/services/surfaceflinger/Android.mk \
+ ./frameworks/native/services/batteryservice/Android.mk \
++./frameworks/native/services/inputflinger/Android.mk \
+ ./frameworks/native/cmds/servicemanager/Android.mk \
+ ./frameworks/opt/emoji/Android.mk \
+ ./frameworks/av/camera/Android.mk \
+@@ -546,6 +549,7 @@ subdir_makefiles := \
+ ./frameworks/av/soundtrigger/Android.mk \
+ ./frameworks/av/services/audiopolicy/Android.mk \
+ ./frameworks/av/services/camera/libcameraservice/Android.mk \
++./frameworks/av/services/medialog/Android.mk \
+ ./frameworks/av/media/libmediaplayerservice/Android.mk \
+ ./frameworks/av/services/audioflinger/Android.mk \
+ ./prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.8/Android.mk \
+-- 
+2.7.4
+
