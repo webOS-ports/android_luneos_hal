@@ -1,0 +1,32 @@
+From 6e197c442a88335dfd4988f8472a1e9a52d83afe Mon Sep 17 00:00:00 2001
+From: Ricardo Salveti de Araujo <ricardo.salveti@canonical.com>
+Date: Thu, 31 Oct 2013 13:38:43 +0200
+Subject: [PATCH 02/10] Remove need for SchedulingPolicyService (JAVA based)
+
+Change-Id: I88f1d15e87db62dccc6bc59098cc2dd490c18095
+Signed-off-by: Jani Monoses <jani@ubuntu.com>
+Signed-off-by: Ricardo Salveti de Araujo <ricardo.salveti@canonical.com>
+Signed-off-by: Ondrej Kubik <ondrej.kubik@canonical.com>
+---
+ services/audioflinger/SchedulingPolicyService.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/services/audioflinger/SchedulingPolicyService.cpp b/services/audioflinger/SchedulingPolicyService.cpp
+index 70a3f1a..43871ef 100644
+--- a/services/audioflinger/SchedulingPolicyService.cpp
++++ b/services/audioflinger/SchedulingPolicyService.cpp
+@@ -30,6 +30,11 @@ static Mutex sMutex;
+ 
+ int requestPriority(pid_t pid, pid_t tid, int32_t prio, bool asynchronous)
+ {
++    /* We don't yet have a native service with permission to change the
++     * scheduling policy for processess and threads, so let's just return
++     * with an error here (Android's Scheduling Policy service is JAVA based */
++    return -1;
++
+     // FIXME merge duplicated code related to service lookup, caching, and error recovery
+     int ret;
+     for (;;) {
+-- 
+2.7.4
+

@@ -1,0 +1,54 @@
+From ba4b3961fe8f83db9008ad67cc563b947e7bb0b4 Mon Sep 17 00:00:00 2001
+From: Alfonso Sanchez-Beato <alfonso.sanchez-beato@canonical.com>
+Date: Thu, 4 Feb 2016 15:43:51 +0100
+Subject: [PATCH 10/10] Fix compilations errors due to Ubuntu patches
+
+---
+ include/media/mediarecorder.h             | 1 +
+ include/media/stagefright/ExtendedStats.h | 1 +
+ media/libmedia/mediarecorder.cpp          | 5 +++++
+ 3 files changed, 7 insertions(+)
+
+diff --git a/include/media/mediarecorder.h b/include/media/mediarecorder.h
+index bd29d74..4f76383 100755
+--- a/include/media/mediarecorder.h
++++ b/include/media/mediarecorder.h
+@@ -249,6 +249,7 @@ public:
+     status_t    close();
+     status_t    release();
+     void        notify(int msg, int ext1, int ext2);
++    void        readAudio();
+     sp<IGraphicBufferProducer>     querySurfaceMediaSourceFromMediaServer();
+ 
+ private:
+diff --git a/include/media/stagefright/ExtendedStats.h b/include/media/stagefright/ExtendedStats.h
+index f744358..57b8793 100755
+--- a/include/media/stagefright/ExtendedStats.h
++++ b/include/media/stagefright/ExtendedStats.h
+@@ -213,6 +213,7 @@ public:
+     int32_t setFrameRate(int32_t frameRate) {
+         mFrameRate = frameRate;
+         mProfileTimes->setWindowSize(mFrameRate);
++        return mFrameRate;
+     }
+ 
+ protected:
+diff --git a/media/libmedia/mediarecorder.cpp b/media/libmedia/mediarecorder.cpp
+index 91d3d18..00fc404 100755
+--- a/media/libmedia/mediarecorder.cpp
++++ b/media/libmedia/mediarecorder.cpp
+@@ -724,6 +724,11 @@ void MediaRecorder::notify(int msg, int ext1, int ext2)
+     }
+ }
+ 
++/* Needed for compatibilty with ubuntu patches */
++void MediaRecorder::readAudio()
++{
++}
++
+ void MediaRecorder::died()
+ {
+     ALOGV("died");
+-- 
+2.7.4
+

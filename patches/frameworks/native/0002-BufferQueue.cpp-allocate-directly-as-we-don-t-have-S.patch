@@ -1,0 +1,42 @@
+From 08dd55c73c4177c3058c6431b35bf57ee1f797c0 Mon Sep 17 00:00:00 2001
+From: Ondrej Kubik <ondrej.kubik@canonical.com>
+Date: Tue, 14 Jul 2015 11:48:56 +0100
+Subject: [PATCH 2/2] BufferQueue.cpp: allocate directly as we don't have SF
+
+Change-Id: I4bd3f6e057a24fe16360b7930c6fdd1f8ad9cbf2
+
+Signed-off-by: Ondrej Kubik <ondrej.kubik@canonical.com>
+---
+ libs/gui/BufferQueueCore.cpp | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/libs/gui/BufferQueueCore.cpp b/libs/gui/BufferQueueCore.cpp
+index bb7a6d9..626e8b8 100644
+--- a/libs/gui/BufferQueueCore.cpp
++++ b/libs/gui/BufferQueueCore.cpp
+@@ -26,6 +26,7 @@
+ #include <gui/BufferQueueCore.h>
+ #include <gui/IConsumerListener.h>
+ #include <gui/IGraphicBufferAlloc.h>
++#include <gui/GraphicBufferAlloc.h>
+ #include <gui/IProducerListener.h>
+ #include <gui/ISurfaceComposer.h>
+ #include <private/gui/ComposerService.h>
+@@ -69,10 +70,10 @@ BufferQueueCore::BufferQueueCore(const sp<IGraphicBufferAlloc>& allocator) :
+     mIsAllocatingCondition()
+ {
+     if (allocator == NULL) {
+-        sp<ISurfaceComposer> composer(ComposerService::getComposerService());
+-        mAllocator = composer->createGraphicBufferAlloc();
+-        if (mAllocator == NULL) {
+-            BQ_LOGE("createGraphicBufferAlloc failed");
++        // Allocate directly as with Ubuntu Touch we don't have SF
++        mAllocator = new GraphicBufferAlloc();
++        if (mAllocator == 0) {
++            BQ_LOGE("GraphicBufferAlloc() failed in BufferQueue()");
+         }
+     }
+ }
+-- 
+2.7.4
+

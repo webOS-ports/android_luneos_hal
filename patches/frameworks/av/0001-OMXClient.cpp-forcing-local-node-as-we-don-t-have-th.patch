@@ -1,0 +1,74 @@
+From 78c9b4622a4f8fe98eec59b4d21fa8c8d4cef73e Mon Sep 17 00:00:00 2001
+From: Ricardo Salveti de Araujo <ricardo.salveti@canonical.com>
+Date: Mon, 16 Sep 2013 20:51:20 -0300
+Subject: [PATCH 01/10] OMXClient.cpp: forcing local node as we don't have the
+ media.player service anymore
+
+Change-Id: I1d702f651de360533fbcee352c489fe970d4a100
+Signed-off-by: Ricardo Salveti de Araujo <ricardo.salveti@canonical.com>
+Signed-off-by: Ondrej Kubik <ondrej.kubik@canonical.com>
+---
+ media/libstagefright/OMXClient.cpp | 36 +++++++++++++++++++++++-------------
+ 1 file changed, 23 insertions(+), 13 deletions(-)
+
+diff --git a/media/libstagefright/OMXClient.cpp b/media/libstagefright/OMXClient.cpp
+index 47455ca..a109f02 100644
+--- a/media/libstagefright/OMXClient.cpp
++++ b/media/libstagefright/OMXClient.cpp
+@@ -215,10 +215,15 @@ status_t MuxOMX::allocateNode(
+ 
+     if (CanLiveLocally(name)) {
+         if (mLocalOMX == NULL) {
++            ALOGI("Allocating local Node.");
+             mLocalOMX = new OMX;
+         }
+         omx = mLocalOMX;
+     } else {
++        if (mRemoteOMX == NULL) {
++            ALOGI("Allocating remote Node (false remote).");
++            mRemoteOMX = new OMX;
++        }
+         omx = mRemoteOMX;
+     }
+ 
+@@ -396,19 +401,24 @@ OMXClient::OMXClient() {
+ }
+ 
+ status_t OMXClient::connect() {
+-    sp<IServiceManager> sm = defaultServiceManager();
+-    sp<IBinder> binder = sm->getService(String16("media.player"));
+-    sp<IMediaPlayerService> service = interface_cast<IMediaPlayerService>(binder);
+-
+-    CHECK(service.get() != NULL);
+-
+-    mOMX = service->getOMX();
+-    CHECK(mOMX.get() != NULL);
+-
+-    if (!mOMX->livesLocally(0 /* node */, getpid())) {
+-        ALOGI("Using client-side OMX mux.");
+-        mOMX = new MuxOMX(mOMX);
+-    }
++//     sp<IServiceManager> sm = defaultServiceManager();
++//     sp<IBinder> binder = sm->getService(String16("media.player"));
++//     sp<IMediaPlayerService> service = interface_cast<IMediaPlayerService>(binder);
++//
++//     CHECK(service.get() != NULL);
++//
++//     mOMX = service->getOMX();
++//     CHECK(mOMX.get() != NULL);
++//
++//     if (!mOMX->livesLocally(0 /* node */, getpid())) {
++//         ALOGI("Using client-side OMX mux.");
++//         mOMX = new MuxOMX(mOMX);
++//     }
++
++    /* Forcing client-side OMX mux as we don't have the media.player
++     * service running in Ubuntu Touch */
++    ALOGI("Using client-side OMX mux.");
++    mOMX = new MuxOMX(mOMX);
+ 
+     return OK;
+ }
+-- 
+2.7.4
+

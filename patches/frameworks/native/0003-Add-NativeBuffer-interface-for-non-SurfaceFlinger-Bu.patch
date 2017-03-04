@@ -1,0 +1,57 @@
+From d22f69d9100a7adf91492a1985eed7e8e912fa1a Mon Sep 17 00:00:00 2001
+From: Ondrej Kubik <ondrej.kubik@canonical.com>
+Date: Tue, 14 Jul 2015 11:48:05 +0100
+Subject: [PATCH 3/3] Add NativeBuffer interface for non-SurfaceFlinger
+ BufferQueues
+
+Change-Id: I62381a2e8a1ae9f3053298292197dbe249a19c92
+
+Signed-off-by: Ondrej Kubik <ondrej.kubik@canonical.com>
+---
+ include/gui/NativeBufferAlloc.h | 34 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 34 insertions(+)
+ create mode 100644 include/gui/NativeBufferAlloc.h
+
+diff --git a/include/gui/NativeBufferAlloc.h b/include/gui/NativeBufferAlloc.h
+new file mode 100644
+index 0000000..94fd667
+--- /dev/null
++++ b/include/gui/NativeBufferAlloc.h
+@@ -0,0 +1,34 @@
++/*
++ * Copyright (C) 2013 Canonical Ltd
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Authored by: Ricardo Mendoza <ricardo.mendoza@canonical.com>
++ */
++
++#ifndef NATIVE_BUFFER_ALLOC_H
++#define NATIVE_BUFFER_ALLOC_H
++
++namespace android
++{
++class NativeBufferAlloc : public RefBase
++{
++public:
++    NativeBufferAlloc();
++    virtual ~NativeBufferAlloc();
++    virtual sp<GraphicBuffer> createGraphicBuffer(uint32_t w, uint32_t h,
++        PixelFormat format, uint32_t usage, status_t* error);
++};
++}
++
++#endif /* NATIVE_BUFFER_ALLOC_H */
+-- 
+2.7.4
+

@@ -1,0 +1,3984 @@
+From 59c5391afa20911a834e70eae49c4832a2988d31 Mon Sep 17 00:00:00 2001
+From: Jim Hodapp <jim.hodapp@canonical.com>
+Date: Thu, 10 Jul 2014 16:59:31 -0400
+Subject: [PATCH 08/10] Gut the use of AudioFlinger for recording and replace
+ it with custom RecordThread, RecordTrack and RecordHandle implementations *
+ Make sure addBatteryData is disabled so that MediaService isn't called *
+ Disable AudioFlinger call to get number of frame lost * Audio recording
+ works, also clean up the code to remove many of the unnecessary commented out
+ AudioFlinger calls * Clean up code more, removed commented out lines of code
+ that will never be used, added some comments
+
+Change-Id: I875bc90223369d9a5653c5aeeb2d49175f65e08b
+Signed-off-by: Jim Hodapp <jim.hodapp@canonical.com>
+Signed-off-by: Ondrej Kubik <ondrej.kubik@canonical.com>
+---
+ include/media/AudioRecordHybris.h                  |  539 ++++++++++
+ include/media/AudioSystem.h                        |    9 +
+ include/media/IMediaRecorderClient.h               |    1 +
+ include/media/camera_record_service.h              |  129 +++
+ include/media/record_thread.h                      |  192 ++++
+ include/media/record_track.h                       |  171 +++
+ include/media/stagefright/AudioSource.h            |   16 +
+ include/private/media/AudioTrackShared.h           |   12 +-
+ media/libmedia/Android.mk                          |   12 +-
+ media/libmedia/AudioRecordHybris.cpp               | 1129 ++++++++++++++++++++
+ media/libmedia/AudioSystem.cpp                     |  104 +-
+ media/libmedia/AudioTrackShared.cpp                |   15 +
+ media/libmedia/IMediaRecorderClient.cpp            |   13 +
+ media/libmedia/camera_record_service.cpp           |  293 +++++
+ media/libmedia/record_thread.cpp                   |  567 ++++++++++
+ media/libmedia/record_track.cpp                    |  272 +++++
+ .../libmediaplayerservice/StagefrightRecorder.cpp  |   25 +
+ media/libmediaplayerservice/StagefrightRecorder.h  |    2 +
+ media/libstagefright/AudioSource.cpp               |   35 +-
+ media/libstagefright/MPEG4Writer.cpp               |    5 +-
+ 20 files changed, 3509 insertions(+), 32 deletions(-)
+ create mode 100644 include/media/AudioRecordHybris.h
+ create mode 100644 include/media/camera_record_service.h
+ create mode 100644 include/media/record_thread.h
+ create mode 100644 include/media/record_track.h
+ create mode 100644 media/libmedia/AudioRecordHybris.cpp
+ create mode 100644 media/libmedia/camera_record_service.cpp
+ create mode 100644 media/libmedia/record_thread.cpp
+ create mode 100644 media/libmedia/record_track.cpp
+
+diff --git a/include/media/AudioRecordHybris.h b/include/media/AudioRecordHybris.h
+new file mode 100644
+index 0000000..7008a02
+--- /dev/null
++++ b/include/media/AudioRecordHybris.h
+@@ -0,0 +1,539 @@
++/*
++ * Copyright (C) 2008 The Android Open Source Project
++ * Copyright (C) 2014 Canonical Ltd
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Authored by: Jim Hodapp <jim.hodapp@canonical.com>
++ */
++
++#ifndef HYBRIS_AUDIORECORD_H
++#define HYBRIS_AUDIORECORD_H
++
++#include <cutils/sched_policy.h>
++#include <media/AudioSystem.h>
++#include <media/IAudioRecord.h>
++#include <utils/threads.h>
++
++namespace android {
++
++// ----------------------------------------------------------------------------
++
++struct audio_track_cblk_t;
++class AudioRecordClientProxy;
++
++// ----------------------------------------------------------------------------
++
++class AudioRecord : public RefBase
++{
++public:
++
++    /* Events used by AudioRecord callback function (callback_t).
++     * Keep in sync with frameworks/base/media/java/android/media/AudioRecord.java NATIVE_EVENT_*.
++     */
++    enum event_type {
++        EVENT_MORE_DATA = 0,        // Request to read available data from buffer.
++                                    // If this event is delivered but the callback handler
++                                    // does not want to read the available data, the handler must
++                                    // explicitly
++                                    // ignore the event by setting frameCount to zero.
++        EVENT_OVERRUN = 1,          // Buffer overrun occurred.
++        EVENT_MARKER = 2,           // Record head is at the specified marker position
++                                    // (See setMarkerPosition()).
++        EVENT_NEW_POS = 3,          // Record head is at a new position
++                                    // (See setPositionUpdatePeriod()).
++        EVENT_NEW_IAUDIORECORD = 4, // IAudioRecord was re-created, either due to re-routing and
++                                    // voluntary invalidation by mediaserver, or mediaserver crash.
++    };
++
++    /* Client should declare Buffer on the stack and pass address to obtainBuffer()
++     * and releaseBuffer().  See also callback_t for EVENT_MORE_DATA.
++     */
++
++    class Buffer
++    {
++    public:
++        // FIXME use m prefix
++        size_t      frameCount;     // number of sample frames corresponding to size;
++                                    // on input it is the number of frames available,
++                                    // on output is the number of frames actually drained
++                                    // (currently ignored but will make the primary field in future)
++
++        size_t      size;           // input/output in bytes == frameCount * frameSize
++                                    // on output is the number of bytes actually drained
++                                    // FIXME this is redundant with respect to frameCount,
++                                    // and TRANSFER_OBTAIN mode is broken for 8-bit data
++                                    // since we don't define the frame format
++
++        union {
++            void*       raw;
++            short*      i16;        // signed 16-bit
++            int8_t*     i8;         // unsigned 8-bit, offset by 0x80
++        };
++    };
++
++    /* As a convenience, if a callback is supplied, a handler thread
++     * is automatically created with the appropriate priority. This thread
++     * invokes the callback when a new buffer becomes available or various conditions occur.
++     * Parameters:
++     *
++     * event:   type of event notified (see enum AudioRecord::event_type).
++     * user:    Pointer to context for use by the callback receiver.
++     * info:    Pointer to optional parameter according to event type:
++     *          - EVENT_MORE_DATA: pointer to AudioRecord::Buffer struct. The callback must not read
++     *            more bytes than indicated by 'size' field and update 'size' if fewer bytes are
++     *            consumed.
++     *          - EVENT_OVERRUN: unused.
++     *          - EVENT_MARKER: pointer to const uint32_t containing the marker position in frames.
++     *          - EVENT_NEW_POS: pointer to const uint32_t containing the new position in frames.
++     *          - EVENT_NEW_IAUDIORECORD: unused.
++     */
++
++    typedef void (*callback_t)(int event, void* user, void *info);
++
++    /* Returns the minimum frame count required for the successful creation of
++     * an AudioRecord object.
++     * Returned status (from utils/Errors.h) can be:
++     *  - NO_ERROR: successful operation
++     *  - NO_INIT: audio server or audio hardware not initialized
++     *  - BAD_VALUE: unsupported configuration
++     * frameCount is guaranteed to be non-zero if status is NO_ERROR,
++     * and is undefined otherwise.
++     */
++
++     static status_t getMinFrameCount(size_t* frameCount,
++                                      uint32_t sampleRate,
++                                      audio_format_t format,
++                                      audio_channel_mask_t channelMask);
++
++    /* How data is transferred from AudioRecord
++     */
++    enum transfer_type {
++        TRANSFER_DEFAULT,   // not specified explicitly; determine from the other parameters
++        TRANSFER_CALLBACK,  // callback EVENT_MORE_DATA
++        TRANSFER_OBTAIN,    // FIXME deprecated: call obtainBuffer() and releaseBuffer()
++        TRANSFER_SYNC,      // synchronous read()
++    };
++
++    /* Constructs an uninitialized AudioRecord. No connection with
++     * AudioFlinger takes place.  Use set() after this.
++     */
++                        AudioRecord();
++
++    /* Creates an AudioRecord object and registers it with AudioFlinger.
++     * Once created, the track needs to be started before it can be used.
++     * Unspecified values are set to appropriate default values.
++     *
++     * Parameters:
++     *
++     * inputSource:        Select the audio input to record from (e.g. AUDIO_SOURCE_DEFAULT).
++     * sampleRate:         Data sink sampling rate in Hz.
++     * format:             Audio format (e.g AUDIO_FORMAT_PCM_16_BIT for signed
++     *                     16 bits per sample).
++     * channelMask:        Channel mask, such that audio_is_input_channel(channelMask) is true.
++     * frameCount:         Minimum size of track PCM buffer in frames. This defines the
++     *                     application's contribution to the
++     *                     latency of the track.  The actual size selected by the AudioRecord could
++     *                     be larger if the requested size is not compatible with current audio HAL
++     *                     latency.  Zero means to use a default value.
++     * cbf:                Callback function. If not null, this function is called periodically
++     *                     to consume new data and inform of marker, position updates, etc.
++     * user:               Context for use by the callback receiver.
++     * notificationFrames: The callback function is called each time notificationFrames PCM
++     *                     frames are ready in record track output buffer.
++     * sessionId:          Not yet supported.
++     * transferType:       How data is transferred from AudioRecord.
++     * flags:              See comments on audio_input_flags_t in <system/audio.h>
++     * threadCanCallJava:  Not present in parameter list, and so is fixed at false.
++     */
++
++                        AudioRecord(audio_source_t inputSource,
++                                    uint32_t sampleRate,
++                                    audio_format_t format,
++                                    audio_channel_mask_t channelMask,
++                                    size_t frameCount = 0,
++                                    callback_t cbf = NULL,
++                                    void* user = NULL,
++                                    uint32_t notificationFrames = 0,
++                                    int sessionId = AUDIO_SESSION_ALLOCATE,
++                                    transfer_type transferType = TRANSFER_DEFAULT,
++                                    audio_input_flags_t flags = AUDIO_INPUT_FLAG_NONE);
++
++    /* Terminates the AudioRecord and unregisters it from AudioFlinger.
++     * Also destroys all resources associated with the AudioRecord.
++     */
++protected:
++                        virtual ~AudioRecord();
++public:
++
++    /* Initialize an AudioRecord that was created using the AudioRecord() constructor.
++     * Don't call set() more than once, or after an AudioRecord() constructor that takes parameters.
++     * Returned status (from utils/Errors.h) can be:
++     *  - NO_ERROR: successful intialization
++     *  - INVALID_OPERATION: AudioRecord is already initialized or record device is already in use
++     *  - BAD_VALUE: invalid parameter (channelMask, format, sampleRate...)
++     *  - NO_INIT: audio server or audio hardware not initialized
++     *  - PERMISSION_DENIED: recording is not allowed for the requesting process
++     * If status is not equal to NO_ERROR, don't call any other APIs on this AudioRecord.
++     *
++     * Parameters not listed in the AudioRecord constructors above:
++     *
++     * threadCanCallJava:  Whether callbacks are made from an attached thread and thus can call JNI.
++     */
++            status_t    set(audio_source_t inputSource,
++                            uint32_t sampleRate,
++                            audio_format_t format,
++                            audio_channel_mask_t channelMask,
++                            size_t frameCount = 0,
++                            callback_t cbf = NULL,
++                            void* user = NULL,
++                            uint32_t notificationFrames = 0,
++                            bool threadCanCallJava = false,
++                            int sessionId = AUDIO_SESSION_ALLOCATE,
++                            transfer_type transferType = TRANSFER_DEFAULT,
++                            audio_input_flags_t flags = AUDIO_INPUT_FLAG_NONE);
++
++    /* Result of constructing the AudioRecord. This must be checked for successful initialization
++     * before using any AudioRecord API (except for set()), because using
++     * an uninitialized AudioRecord produces undefined results.
++     * See set() method above for possible return codes.
++     */
++            status_t    initCheck() const   { return mStatus; }
++
++    /* Returns this track's estimated latency in milliseconds.
++     * This includes the latency due to AudioRecord buffer size,
++     * and audio hardware driver.
++     */
++            uint32_t    latency() const     { return mLatency; }
++
++   /* getters, see constructor and set() */
++
++            audio_format_t format() const   { return mFormat; }
++            uint32_t    channelCount() const    { return mChannelCount; }
++            size_t      frameCount() const  { return mFrameCount; }
++            size_t      frameSize() const   { return mFrameSize; }
++            audio_source_t inputSource() const  { return mInputSource; }
++
++    /* After it's created the track is not active. Call start() to
++     * make it active. If set, the callback will start being called.
++     * If event is not AudioSystem::SYNC_EVENT_NONE, the capture start will be delayed until
++     * the specified event occurs on the specified trigger session.
++     */
++            status_t    start(AudioSystem::sync_event_t event = AudioSystem::SYNC_EVENT_NONE,
++                              int triggerSession = 0);
++
++    /* Stop a track.  The callback will cease being called.  Note that obtainBuffer() still
++     * works and will drain buffers until the pool is exhausted, and then will return WOULD_BLOCK.
++     */
++            void        stop();
++            bool        stopped() const;
++
++    /* Return the sink sample rate for this record track in Hz.
++     * Unlike AudioTrack, the sample rate is const after initialization, so doesn't need a lock.
++     */
++            uint32_t    getSampleRate() const   { return mSampleRate; }
++
++    /* Return the notification frame count.
++     * This is approximately how often the callback is invoked, for transfer type TRANSFER_CALLBACK.
++     */
++            size_t      notificationFrames() const  { return mNotificationFramesAct; }
++
++    /* Sets marker position. When record reaches the number of frames specified,
++     * a callback with event type EVENT_MARKER is called. Calling setMarkerPosition
++     * with marker == 0 cancels marker notification callback.
++     * To set a marker at a position which would compute as 0,
++     * a workaround is to set the marker at a nearby position such as ~0 or 1.
++     * If the AudioRecord has been opened with no callback function associated,
++     * the operation will fail.
++     *
++     * Parameters:
++     *
++     * marker:   marker position expressed in wrapping (overflow) frame units,
++     *           like the return value of getPosition().
++     *
++     * Returned status (from utils/Errors.h) can be:
++     *  - NO_ERROR: successful operation
++     *  - INVALID_OPERATION: the AudioRecord has no callback installed.
++     */
++            status_t    setMarkerPosition(uint32_t marker);
++            status_t    getMarkerPosition(uint32_t *marker) const;
++
++    /* Sets position update period. Every time the number of frames specified has been recorded,
++     * a callback with event type EVENT_NEW_POS is called.
++     * Calling setPositionUpdatePeriod with updatePeriod == 0 cancels new position notification
++     * callback.
++     * If the AudioRecord has been opened with no callback function associated,
++     * the operation will fail.
++     * Extremely small values may be rounded up to a value the implementation can support.
++     *
++     * Parameters:
++     *
++     * updatePeriod:  position update notification period expressed in frames.
++     *
++     * Returned status (from utils/Errors.h) can be:
++     *  - NO_ERROR: successful operation
++     *  - INVALID_OPERATION: the AudioRecord has no callback installed.
++     */
++            status_t    setPositionUpdatePeriod(uint32_t updatePeriod);
++            status_t    getPositionUpdatePeriod(uint32_t *updatePeriod) const;
++
++    /* Return the total number of frames recorded since recording started.
++     * The counter will wrap (overflow) periodically, e.g. every ~27 hours at 44.1 kHz.
++     * It is reset to zero by stop().
++     *
++     * Parameters:
++     *
++     *  position:  Address where to return record head position.
++     *
++     * Returned status (from utils/Errors.h) can be:
++     *  - NO_ERROR: successful operation
++     *  - BAD_VALUE:  position is NULL
++     */
++            status_t    getPosition(uint32_t *position) const;
++
++    /* Returns a handle on the audio input used by this AudioRecord.
++     *
++     * Parameters:
++     *  none.
++     *
++     * Returned value:
++     *  handle on audio hardware input
++     */
++            audio_io_handle_t    getInput() const;
++
++    /* Returns the audio session ID associated with this AudioRecord.
++     *
++     * Parameters:
++     *  none.
++     *
++     * Returned value:
++     *  AudioRecord session ID.
++     *
++     * No lock needed because session ID doesn't change after first set().
++     */
++            int    getSessionId() const { return mSessionId; }
++
++    /* Obtains a buffer of up to "audioBuffer->frameCount" full frames.
++     * After draining these frames of data, the caller should release them with releaseBuffer().
++     * If the track buffer is not empty, obtainBuffer() returns as many contiguous
++     * full frames as are available immediately.
++     * If the track buffer is empty and track is stopped, obtainBuffer() returns WOULD_BLOCK
++     * regardless of the value of waitCount.
++     * If the track buffer is empty and track is not stopped, obtainBuffer() blocks with a
++     * maximum timeout based on waitCount; see chart below.
++     * Buffers will be returned until the pool
++     * is exhausted, at which point obtainBuffer() will either block
++     * or return WOULD_BLOCK depending on the value of the "waitCount"
++     * parameter.
++     *
++     * obtainBuffer() and releaseBuffer() are deprecated for direct use by applications,
++     * which should use read() or callback EVENT_MORE_DATA instead.
++     *
++     * Interpretation of waitCount:
++     *  +n  limits wait time to n * WAIT_PERIOD_MS,
++     *  -1  causes an (almost) infinite wait time,
++     *   0  non-blocking.
++     *
++     * Buffer fields
++     * On entry:
++     *  frameCount  number of frames requested
++     * After error return:
++     *  frameCount  0
++     *  size        0
++     *  raw         undefined
++     * After successful return:
++     *  frameCount  actual number of frames available, <= number requested
++     *  size        actual number of bytes available
++     *  raw         pointer to the buffer
++     */
++
++    /* FIXME Deprecated public API for TRANSFER_OBTAIN mode */
++            status_t    obtainBuffer(Buffer* audioBuffer, int32_t waitCount)
++                                __attribute__((__deprecated__));
++
++private:
++    /* If nonContig is non-NULL, it is an output parameter that will be set to the number of
++     * additional non-contiguous frames that are available immediately.
++     * FIXME We could pass an array of Buffers instead of only one Buffer to obtainBuffer(),
++     * in case the requested amount of frames is in two or more non-contiguous regions.
++     * FIXME requested and elapsed are both relative times.  Consider changing to absolute time.
++     */
++            status_t    obtainBuffer(Buffer* audioBuffer, const struct timespec *requested,
++                                     struct timespec *elapsed = NULL, size_t *nonContig = NULL);
++public:
++
++    /* Release an emptied buffer of "audioBuffer->frameCount" frames for AudioFlinger to re-fill. */
++    // FIXME make private when obtainBuffer() for TRANSFER_OBTAIN is removed
++            void        releaseBuffer(Buffer* audioBuffer);
++
++    /* As a convenience we provide a read() interface to the audio buffer.
++     * Input parameter 'size' is in byte units.
++     * This is implemented on top of obtainBuffer/releaseBuffer. For best
++     * performance use callbacks. Returns actual number of bytes read >= 0,
++     * or one of the following negative status codes:
++     *      INVALID_OPERATION   AudioRecord is configured for streaming mode
++     *      BAD_VALUE           size is invalid
++     *      WOULD_BLOCK         when obtainBuffer() returns same, or
++     *                          AudioRecord was stopped during the read
++     *      or any other error code returned by IAudioRecord::start() or restoreRecord_l().
++     */
++            ssize_t     read(void* buffer, size_t size);
++
++    /* Return the number of input frames lost in the audio driver since the last call of this
++     * function.  Audio driver is expected to reset the value to 0 and restart counting upon
++     * returning the current value by this function call.  Such loss typically occurs when the
++     * user space process is blocked longer than the capacity of audio driver buffers.
++     * Units: the number of input audio frames.
++     * FIXME The side-effect of resetting the counter may be incompatible with multi-client.
++     * Consider making it more like AudioTrack::getUnderrunFrames which doesn't have side effects.
++     */
++            uint32_t    getInputFramesLost() const;
++
++private:
++    /* copying audio record objects is not allowed */
++                        AudioRecord(const AudioRecord& other);
++            AudioRecord& operator = (const AudioRecord& other);
++
++    /* a small internal class to handle the callback */
++    class AudioRecordThread : public Thread
++    {
++    public:
++        AudioRecordThread(AudioRecord& receiver, bool bCanCallJava = false);
++
++        // Do not call Thread::requestExitAndWait() without first calling requestExit().
++        // Thread::requestExitAndWait() is not virtual, and the implementation doesn't do enough.
++        virtual void        requestExit();
++
++                void        pause();    // suspend thread from execution at next loop boundary
++                void        resume();   // allow thread to execute, if not requested to exit
++
++    private:
++                void        pauseInternal(nsecs_t ns = 0LL);
++                                        // like pause(), but only used internally within thread
++
++        friend class AudioRecord;
++        virtual bool        threadLoop();
++        AudioRecord&        mReceiver;
++        virtual ~AudioRecordThread();
++        Mutex               mMyLock;    // Thread::mLock is private
++        Condition           mMyCond;    // Thread::mThreadExitedCondition is private
++        bool                mPaused;    // whether thread is requested to pause at next loop entry
++        bool                mPausedInt; // whether thread internally requests pause
++        nsecs_t             mPausedNs;  // if mPausedInt then associated timeout, otherwise ignored
++        bool                mIgnoreNextPausedInt;   // whether to ignore next mPausedInt request
++    };
++
++            // body of AudioRecordThread::threadLoop()
++            // returns the maximum amount of time before we would like to run again, where:
++            //      0           immediately
++            //      > 0         no later than this many nanoseconds from now
++            //      NS_WHENEVER still active but no particular deadline
++            //      NS_INACTIVE inactive so don't run again until re-started
++            //      NS_NEVER    never again
++            static const nsecs_t NS_WHENEVER = -1, NS_INACTIVE = -2, NS_NEVER = -3;
++            nsecs_t processAudioBuffer();
++
++            // caller must hold lock on mLock for all _l methods
++
++            status_t openRecord_l(size_t epoch);
++
++            // FIXME enum is faster than strcmp() for parameter 'from'
++            status_t restoreRecord_l(const char *from);
++
++    sp<AudioRecordThread>   mAudioRecordThread;
++    mutable Mutex           mLock;
++
++    // Current client state:  false = stopped, true = active.  Protected by mLock.  If more states
++    // are added, consider changing this to enum State { ... } mState as in AudioTrack.
++    bool                    mActive;
++
++    // for client callback handler
++    callback_t              mCbf;               // callback handler for events, or NULL
++    void*                   mUserData;
++
++    // for notification APIs
++    uint32_t                mNotificationFramesReq; // requested number of frames between each
++                                                    // notification callback
++                                                    // as specified in constructor or set()
++    uint32_t                mNotificationFramesAct; // actual number of frames between each
++                                                    // notification callback
++    bool                    mRefreshRemaining;      // processAudioBuffer() should refresh
++                                                    // mRemainingFrames and mRetryOnPartialBuffer
++
++    // These are private to processAudioBuffer(), and are not protected by a lock
++    uint32_t                mRemainingFrames;       // number of frames to request in obtainBuffer()
++    bool                    mRetryOnPartialBuffer;  // sleep and retry after partial obtainBuffer()
++    uint32_t                mObservedSequence;      // last observed value of mSequence
++
++    uint32_t                mMarkerPosition;    // in wrapping (overflow) frame units
++    bool                    mMarkerReached;
++    uint32_t                mNewPosition;       // in frames
++    uint32_t                mUpdatePeriod;      // in frames, zero means no EVENT_NEW_POS
++
++    status_t                mStatus;
++
++    size_t                  mFrameCount;            // corresponds to current IAudioRecord, value is
++                                                    // reported back by AudioFlinger to the client
++    size_t                  mReqFrameCount;         // frame count to request the first or next time
++                                                    // a new IAudioRecord is needed, non-decreasing
++
++    // constant after constructor or set()
++    uint32_t                mSampleRate;
++    audio_format_t          mFormat;
++    uint32_t                mChannelCount;
++    size_t                  mFrameSize;         // app-level frame size == AudioFlinger frame size
++    audio_source_t          mInputSource;
++    uint32_t                mLatency;           // in ms
++    audio_channel_mask_t    mChannelMask;
++    audio_input_flags_t     mFlags;
++    int                     mSessionId;
++    transfer_type           mTransfer;
++
++    // Next 5 fields may be changed if IAudioRecord is re-created, but always != 0
++    // provided the initial set() was successful
++    sp<IAudioRecord>        mAudioRecord;
++    sp<IMemory>             mCblkMemory;
++    audio_track_cblk_t*     mCblk;              // re-load after mLock.unlock()
++    sp<IMemory>             mBufferMemory;
++    audio_io_handle_t       mInput;             // returned by AudioSystem::getInput()
++
++    int                     mPreviousPriority;  // before start()
++    SchedPolicy             mPreviousSchedulingGroup;
++    bool                    mAwaitBoost;    // thread should wait for priority boost before running
++
++    // The proxy should only be referenced while a lock is held because the proxy isn't
++    // multi-thread safe.
++    // An exception is that a blocking ClientProxy::obtainBuffer() may be called without a lock,
++    // provided that the caller also holds an extra reference to the proxy and shared memory to keep
++    // them around in case they are replaced during the obtainBuffer().
++    sp<AudioRecordClientProxy> mProxy;
++
++    bool                    mInOverrun;         // whether recorder is currently in overrun state
++
++private:
++    class DeathNotifier : public IBinder::DeathRecipient {
++    public:
++        DeathNotifier(AudioRecord* audioRecord) : mAudioRecord(audioRecord) { }
++    protected:
++        virtual void        binderDied(const wp<IBinder>& who);
++    private:
++        const wp<AudioRecord> mAudioRecord;
++    };
++
++    sp<DeathNotifier>       mDeathNotifier;
++    uint32_t                mSequence;              // incremented for each new IAudioRecord attempt
++};
++
++}; // namespace android
++
++#endif // HYBRIS_AUDIORECORD_H
+diff --git a/include/media/AudioSystem.h b/include/media/AudioSystem.h
+index 698bf2e..5c75479 100644
+--- a/include/media/AudioSystem.h
++++ b/include/media/AudioSystem.h
+@@ -33,6 +33,7 @@ namespace android {
+ typedef void (*audio_error_callback)(status_t err);
+ 
+ class IAudioFlinger;
++class ICameraRecordService;
+ class IAudioPolicyService;
+ class String8;
+ 
+@@ -95,6 +96,9 @@ public:
+     // helper function to obtain AudioFlinger service handle
+     static const sp<IAudioFlinger> get_audio_flinger();
+ 
++    // helper function to obtain CameraRecordService service handle
++    static const sp<ICameraRecordService>& get_camera_record_service();
++
+     static float linearToLog(int volume);
+     static int logToLinear(float volume);
+ 
+@@ -393,6 +397,7 @@ private:
+     static Mutex gLockAPS;   // protects gAudioPolicyService and gAudioPolicyServiceClient
+     static Mutex gLockAPC;   // protects gAudioPortCallback
+     static sp<IAudioFlinger> gAudioFlinger;
++    static sp<ICameraRecordService> gCameraRecord;
+     static audio_error_callback gAudioErrorCallback;
+ 
+     static size_t gInBuffSize;
+@@ -403,6 +408,10 @@ private:
+ 
+     static sp<IAudioPolicyService> gAudioPolicyService;
+ 
++    // This used to be part of AudioFlinger, but brought into here since
++    // we're no longer using AudioFlinger
++    static volatile int32_t        mNextUniqueId;
++
+     // list of output descriptors containing cached parameters
+     // (sampling rate, framecount, channel count...)
+     static DefaultKeyedVector<audio_io_handle_t, OutputDescriptor *> gOutputs;
+diff --git a/include/media/IMediaRecorderClient.h b/include/media/IMediaRecorderClient.h
+index e7d0229..c54f516 100644
+--- a/include/media/IMediaRecorderClient.h
++++ b/include/media/IMediaRecorderClient.h
+@@ -29,6 +29,7 @@ public:
+     DECLARE_META_INTERFACE(MediaRecorderClient);
+ 
+     virtual void notify(int msg, int ext1, int ext2) = 0;
++    virtual void readAudio() = 0;
+ };
+ 
+ // ----------------------------------------------------------------------------
+diff --git a/include/media/camera_record_service.h b/include/media/camera_record_service.h
+new file mode 100644
+index 0000000..2b6254a
+--- /dev/null
++++ b/include/media/camera_record_service.h
+@@ -0,0 +1,129 @@
++/*
++ * Copyright (C) 2014 Canonical Ltd
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Authored by: Jim Hodapp <jim.hodapp@canonical.com>
++ */
++
++ #ifndef CAMERA_RECORD_SERVICE_H
++ #define CAMERA_RECORD_SERVICE_H
++
++#include <media/IAudioRecord.h>
++#include <binder/IInterface.h>
++#include <binder/Parcel.h>
++
++#include <system/audio.h>
++#include <binder/IPCThreadState.h>
++#include <utils/threads.h>
++
++namespace android {
++
++class RecordThread;
++
++class ICameraRecordService : public IInterface
++{
++public:
++    DECLARE_META_INTERFACE(CameraRecordService);
++
++    static const char* exported_service_name() { return "android.media.ICameraRecordService"; }
++
++    virtual status_t initRecord(
++                                uint32_t sampleRate,
++                                audio_format_t format,
++                                audio_channel_mask_t channelMask) = 0;
++    virtual sp<IAudioRecord> openRecord(
++                                uint32_t sampleRate,
++                                audio_format_t format,
++                                audio_channel_mask_t channelMask,
++                                size_t frameCount,
++                                pid_t tid,
++                                int *sessionId,
++                                status_t *status) = 0;
++
++};
++
++class BnCameraRecordService : public BnInterface<ICameraRecordService>
++{
++public:
++    BnCameraRecordService();
++    virtual ~BnCameraRecordService();
++
++    virtual status_t onTransact(uint32_t code, const Parcel& data,
++                                Parcel* reply, uint32_t flags = 0);
++};
++
++enum {
++    INIT_RECORD = IBinder::FIRST_CALL_TRANSACTION,
++    OPEN_RECORD,
++};
++
++class BpCameraRecordService : public BpInterface<ICameraRecordService>
++{
++public:
++    BpCameraRecordService(const sp<IBinder>& impl);
++    ~BpCameraRecordService();
++
++    virtual status_t initRecord(
++                                uint32_t sampleRate,
++                                audio_format_t format,
++                                audio_channel_mask_t channelMask);
++    virtual sp<IAudioRecord> openRecord(
++                                uint32_t sampleRate,
++                                audio_format_t format,
++                                audio_channel_mask_t channelMask,
++                                size_t frameCount,
++                                pid_t tid,
++                                int *sessionId,
++                                status_t *status);
++};
++
++// ----------------------------------------------------------------------------
++
++class CameraRecordService : public BnCameraRecordService
++{
++public:
++    CameraRecordService();
++    virtual ~CameraRecordService();
++
++    static void instantiate();
++
++    uint32_t nextUniqueId();
++
++    virtual status_t initRecord(
++                                uint32_t sampleRate,
++                                audio_format_t format,
++                                audio_channel_mask_t channelMask);
++    virtual sp<IAudioRecord> openRecord(
++                                uint32_t sampleRate,
++                                audio_format_t format,
++                                audio_channel_mask_t channelMask,
++                                size_t frameCount,
++                                pid_t tid,
++                                int *sessionId,
++                                status_t *status);
++
++private:
++    static sp<CameraRecordService>& service_instance();
++
++    sp<RecordThread> mRecordThread;
++    volatile int32_t mNextUniqueId;  // updated by android_atomic_inc
++    mutable Mutex mLock;
++
++    static sp<CameraRecordService> camera_record_service;
++    static Mutex s_lock;
++};
++
++} // namespace android
++
++ #endif // CAMERA_RECORD_SERVICE_H
+diff --git a/include/media/record_thread.h b/include/media/record_thread.h
+new file mode 100644
+index 0000000..6f3123d
+--- /dev/null
++++ b/include/media/record_thread.h
+@@ -0,0 +1,192 @@
++/*
++ * Copyright (C) 2014 Canonical Ltd
++ * Copyright 2012, The Android Open Source Project
++ * NOTE: Reimplemented starting from Android RecordThread class
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Authored by: Jim Hodapp <jim.hodapp@canonical.com>
++ */
++
++ #ifndef RECORD_THREAD_H
++ #define RECORD_THREAD_H
++
++#include <media/AudioBufferProvider.h>
++#include <media/AudioSystem.h>
++#include <system/audio.h>
++#include <utils/threads.h>
++
++namespace android {
++
++class RecordHandle;
++class RecordTrack;
++
++class ThreadBase : public Thread
++{
++public:
++    ThreadBase(audio_io_handle_t id);
++    virtual ~ThreadBase();
++
++    void exit();
++
++    void acquireWakeLock();
++    void releaseWakeLock();
++
++    // see note at declaration of mStandby, mOutDevice and mInDevice
++    bool standby() const { return mStandby; }
++
++protected:
++    friend class RecordTrack;
++
++    SortedVector < sp<RecordTrack> > mTracks;
++    // mActiveTrack has dual roles:  it indicates the current active track, and
++    // is used together with mStartStopCond to indicate start()/stop() progress
++    sp<RecordTrack> mActiveTrack;
++    Condition mStartStopCond;
++
++    // These fields are written and read by thread itself without lock or barrier,
++    // and read by other threads without lock or barrier via standby() , outDevice()
++    // and inDevice().
++    // Because of the absence of a lock or barrier, any other thread that reads
++    // these fields must use the information in isolation, or be prepared to deal
++    // with possibility that it might be inconsistent with other information.
++    bool mStandby;   // Whether thread is currently in standby.
++    const audio_io_handle_t mId;
++
++    uint32_t mSampleRate;
++    size_t mFrameCount;       // output HAL, direct output, record
++    audio_channel_mask_t mChannelMask;
++    uint32_t mChannelCount;
++    size_t mFrameSize;
++    audio_format_t mFormat;
++
++    static const int kNameLength = 16;   // prctl(PR_SET_NAME) limit
++    char mName[kNameLength];
++
++    Condition mWaitWorkCV;
++    mutable Mutex mLock;
++};
++
++//---------- RecordThread -----------//
++
++class RecordThread : public ThreadBase, public AudioBufferProvider
++                        // derives from AudioBufferProvider interface for use by resampler
++{
++public:
++    RecordThread(uint32_t sampleRate,
++            audio_channel_mask_t channelMask,
++            audio_io_handle_t id
++            );
++    virtual ~RecordThread();
++
++    void destroyTrack_l(const sp<RecordTrack>& track);
++    void removeTrack_l(const sp<RecordTrack>& track);
++
++    // Thread virtuals
++    virtual bool        threadLoop();
++    virtual status_t    readyToRun();
++
++    // RefBase
++    virtual void        onFirstRef();
++
++    sp<RecordTrack> createRecordTrack_l(
++            uint32_t sampleRate,
++            audio_format_t format,
++            audio_channel_mask_t channelMask,
++            size_t frameCount,
++            int sessionId,
++            int uid,
++            pid_t tid,
++            status_t *status);
++
++    status_t start(RecordTrack* recordTrack,
++            AudioSystem::sync_event_t event,
++            int triggerSession);
++
++    // ask the thread to stop the specified track, and
++    // return true if the caller should then do it's part of the stopping process
++    bool stop(RecordTrack* recordTrack);
++
++    // AudioBufferProvider interface
++    virtual status_t getNextBuffer(AudioBufferProvider::Buffer* buffer, int64_t pts);
++    virtual void releaseBuffer(AudioBufferProvider::Buffer* buffer);
++
++    void readInputParameters();
++
++    virtual size_t frameCount() const { return mFrameCount; }
++    bool hasFastRecorder() const { return false; }
++
++    class SyncEvent;
++
++    typedef void (*sync_event_callback_t)(const wp<SyncEvent>& event) ;
++
++    class SyncEvent : public RefBase {
++    public:
++        SyncEvent(AudioSystem::sync_event_t type,
++                  int triggerSession,
++                  int listenerSession,
++                  sync_event_callback_t callBack,
++                  void *cookie)
++        : mType(type), mTriggerSession(triggerSession), mListenerSession(listenerSession),
++          mCallback(callBack), mCookie(cookie)
++        {}
++
++        virtual ~SyncEvent() {}
++
++        void trigger() { Mutex::Autolock _l(mLock); if (mCallback) mCallback(this); }
++        bool isCancelled() const { Mutex::Autolock _l(mLock); return (mCallback == NULL); }
++        void cancel() { Mutex::Autolock _l(mLock); mCallback = NULL; }
++        AudioSystem::sync_event_t type() const { return mType; }
++        int triggerSession() const { return mTriggerSession; }
++        int listenerSession() const { return mListenerSession; }
++        void *cookie() const { return mCookie; }
++
++    private:
++          const AudioSystem::sync_event_t mType;
++          const int mTriggerSession;
++          const int mListenerSession;
++          sync_event_callback_t mCallback;
++          void * const mCookie;
++          mutable Mutex mLock;
++    };
++
++private:
++    // Read in audio data from named pipe
++    bool openPipe();
++    ssize_t readPipe(void *buffer, size_t size);
++    void clearSyncStartEvent();
++
++    Condition mStartStopCond;
++
++    // The named pipe file descriptor
++    int m_fifoFd;
++    // interleaved stereo pairs of fixed-point signed Q19.12
++    int32_t *mRsmpOutBuffer;
++    int16_t *mRsmpInBuffer; // [mFrameCount * mChannelCount]
++    size_t mRsmpInIndex;
++    size_t mBufferSize;    // stream buffer size for read()
++    const uint32_t mReqChannelCount;
++    const uint32_t mReqSampleRate;
++    ssize_t mBytesRead;
++    // sync event triggering actual audio capture. Frames read before this event will
++    // be dropped and therefore not read by the application.
++    sp<SyncEvent> mSyncStartEvent;
++    // number of captured frames to drop after the start sync event has been received.
++    // when < 0, maximum frames to drop before starting capture even if sync event is
++    // not received
++    ssize_t mFramestoDrop;
++};
++
++} // namespace android
++
++#endif // RECORD_THREAD_H
+diff --git a/include/media/record_track.h b/include/media/record_track.h
+new file mode 100644
+index 0000000..bb91a91
+--- /dev/null
++++ b/include/media/record_track.h
+@@ -0,0 +1,171 @@
++/*
++ * Copyright (C) 2014 Canonical Ltd
++ * Copyright 2012, The Android Open Source Project
++ * NOTE: Reimplemented starting from Android RecordThread class
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Authored by: Jim Hodapp <jim.hodapp@canonical.com>
++ */
++
++#ifndef RECORD_TRACK_H
++#define RECORD_TRACK_H
++
++#include <limits.h>
++#include <stdint.h>
++#include <sys/types.h>
++
++#include <media/AudioSystem.h>
++#include <private/media/AudioTrackShared.h>
++#include <media/ExtendedAudioBufferProvider.h>
++#include <media/IAudioRecord.h>
++#include <binder/IMemory.h>
++#include <utils/RefBase.h>
++#include <system/audio.h>
++
++namespace android {
++
++class MemoryDealer;
++class RecordThread;
++class ThreadBase;
++
++class RecordTrack : public ExtendedAudioBufferProvider, public RefBase
++{
++public:
++    enum track_state {
++        IDLE,
++        FLUSHED,
++        STOPPED,
++        // next 2 states are currently used for fast tracks
++        // and offloaded tracks only
++        STOPPING_1,     // waiting for first underrun
++        STOPPING_2,     // waiting for presentation complete
++        RESUMING,
++        ACTIVE,
++        PAUSING,
++        PAUSED
++    };
++
++    RecordTrack(ThreadBase *thread,
++            uint32_t sampleRate,
++            audio_format_t format,
++            audio_channel_mask_t channelMask,
++            size_t frameCount,
++            const sp<IMemory>& sharedBuffer,
++            int sessionId,
++            int clientUid);
++    virtual ~RecordTrack();
++
++    virtual status_t start(AudioSystem::sync_event_t event, int triggerSession);
++    virtual void stop();
++
++    sp<IMemory> getCblk() const { return mCblkMemory; }
++    audio_track_cblk_t* cblk() const { return mCblk; }
++    int uid() const { return mUid; }
++
++    // AudioBufferProvider interface
++    virtual status_t getNextBuffer(AudioBufferProvider::Buffer* buffer, int64_t pts = kInvalidPTS);
++    virtual void releaseBuffer(AudioBufferProvider::Buffer* buffer);
++
++    audio_format_t format() const { return mFormat; }
++
++    uint32_t channelCount() const { return mChannelCount; }
++
++    audio_channel_mask_t channelMask() const { return mChannelMask; }
++
++    virtual uint32_t sampleRate() const { return mSampleRate; }
++
++    // Return a pointer to the start of a contiguous slice of the track buffer.
++    // Parameter 'offset' is the requested start position, expressed in
++    // monotonically increasing frame units relative to the track epoch.
++    // Parameter 'frames' is the requested length, also in frame units.
++    // Always returns non-NULL.  It is the caller's responsibility to
++    // verify that this will be successful; the result of calling this
++    // function with invalid 'offset' or 'frames' is undefined.
++    void* getBuffer(uint32_t offset, uint32_t frames) const;
++
++    // ExtendedAudioBufferProvider interface is only needed for Track,
++    // but putting it in TrackBase avoids the complexity of virtual inheritance
++    virtual size_t  framesReady() const { return SIZE_MAX; }
++
++    int sessionId() const { return mSessionId; }
++
++    bool isTerminated() const {
++        return mTerminated;
++    }
++
++    void terminate() {
++        mTerminated = true;
++    }
++
++    void destroy();
++    void invalidate();
++    // clear the buffer overflow flag
++    void clearOverflow() { mOverflow = false; }
++    // set the buffer overflow flag and return previous value
++    bool setOverflow() { bool tmp = mOverflow; mOverflow = true;
++                         return tmp; }
++
++protected:
++    friend class RecordThread;
++
++    RecordTrack(const RecordTrack&);
++    RecordTrack& operator = (const RecordTrack&);
++
++    const wp<ThreadBase> mThread;
++    // The heap that cblk points to
++    sp<MemoryDealer> mMemoryDealer;
++    sp<IMemory> mCblkMemory;
++    audio_track_cblk_t* mCblk;
++    void* mBuffer;                  // start of track buffer, typically in shared memory
++                                    // except for OutputTrack when it is in local memory
++    // we don't really need a lock for these
++    track_state mState;
++    const uint32_t mSampleRate;     // initial sample rate only; for tracks which
++                                    // support dynamic rates, the current value is in control block
++    const audio_format_t mFormat;
++    const audio_channel_mask_t mChannelMask;
++    const uint32_t mChannelCount;
++    const size_t mFrameSize;        // AudioFlinger's view of frame size in shared memory,
++                                    // where for AudioTrack (but not AudioRecord),
++                                    // 8-bit PCM samples are stored as 16-bit
++    const int mSessionId;
++    int mUid;
++    bool mOverflow;  // overflow on most recent attempt to fill client buffer
++    AudioRecordServerProxy* mAudioRecordServerProxy;
++    ServerProxy* mServerProxy;
++    const int mId;
++    bool mTerminated;
++
++    pid_t getpid_cached;
++};
++
++// Server side of the client's IAudioRecord
++class RecordHandle : public android::BnAudioRecord {
++public:
++    RecordHandle(const sp<RecordTrack>& recordTrack);
++    virtual             ~RecordHandle();
++    virtual sp<IMemory> getCblk() const;
++    virtual status_t    start(int /*AudioSystem::sync_event_t*/ event, int triggerSession);
++    virtual void        stop();
++    virtual status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags);
++private:
++    const sp<RecordTrack> mRecordTrack;
++
++    // for use from destructor
++    void                stop_nonvirtual();
++};
++
++} // namespace android
++
++#endif // RECORD_TRACK_H
+diff --git a/include/media/stagefright/AudioSource.h b/include/media/stagefright/AudioSource.h
+index 7674826..abb7ca3 100644
+--- a/include/media/stagefright/AudioSource.h
++++ b/include/media/stagefright/AudioSource.h
+@@ -30,6 +30,7 @@
+ namespace android {
+ 
+ class AudioRecord;
++class IMediaRecorderClient;
+ 
+ struct AudioSource : public MediaSource, public MediaBufferObserver {
+     // Note that the "channels" parameter _is_ the number of channels,
+@@ -41,6 +42,8 @@ struct AudioSource : public MediaSource, public MediaBufferObserver {
+ 
+     status_t initCheck() const;
+ 
++    virtual status_t setListener(const sp<IMediaRecorderClient>& listener);
++
+     virtual status_t start(MetaData *params = NULL);
+     virtual status_t stop() { return reset(); }
+     virtual sp<MetaData> getFormat();
+@@ -56,6 +59,16 @@ struct AudioSource : public MediaSource, public MediaBufferObserver {
+     virtual void onEvent(int event, void* info);
+     virtual void signalBufferReturned(MediaBuffer *buffer);
+ 
++    typedef void (*on_audio_source_read_audio)(void *context);
++
++    // Pass in a function pointer to be called when more audio input data is
++    // ready to be read
++    void setReadAudioCb(on_audio_source_read_audio cb, void *context);
++
++    // Used to cause the application to place more audio data in the
++    // named pipe
++    void triggerReadAudio();
++
+ protected:
+     virtual ~AudioSource();
+ 
+@@ -77,6 +90,9 @@ private:
+     Mutex mLock;
+     Condition mFrameAvailableCondition;
+     Condition mFrameEncodingCompletionCondition;
++    sp<IMediaRecorderClient> mListener;
++    on_audio_source_read_audio mAudioReadCb;
++    void *mAudioReadContext;
+ 
+     AudioRecord::Buffer mTempBuf;
+     uint32_t mPrevPosition;
+diff --git a/include/private/media/AudioTrackShared.h b/include/private/media/AudioTrackShared.h
+index cef1ea2..aed721d 100644
+--- a/include/private/media/AudioTrackShared.h
++++ b/include/private/media/AudioTrackShared.h
+@@ -234,13 +234,9 @@ public:
+     // Call to force an obtainBuffer() to return quickly with -EINTR
+     void        interrupt();
+ 
+-    size_t      getPosition() {
+-        return mEpoch + mCblk->mServer;
+-    }
++    size_t      getPosition();
+ 
+-    void        setEpoch(size_t epoch) {
+-        mEpoch = epoch;
+-    }
++    void        setEpoch(size_t epoch);
+ 
+     void        setMinimum(size_t minimum) {
+         // This can only happen on a 64-bit client
+@@ -254,9 +250,7 @@ public:
+     // in order for the client to be aligned at start of buffer
+     virtual size_t  getMisalignment();
+ 
+-    size_t      getEpoch() const {
+-        return mEpoch;
+-    }
++    size_t      getEpoch() const;
+ 
+     size_t      getFramesFilled();
+ 
+diff --git a/media/libmedia/Android.mk b/media/libmedia/Android.mk
+index 73157bb..8dcf996 100644
+--- a/media/libmedia/Android.mk
++++ b/media/libmedia/Android.mk
+@@ -33,7 +33,10 @@ LOCAL_SRC_FILES:= \
+     IDrm.cpp \
+     IDrmClient.cpp \
+     IHDCP.cpp \
+-    AudioRecord.cpp \
++    record_thread.cpp \
++    record_track.cpp \
++    camera_record_service.cpp \
++    AudioRecordHybris.cpp \
+     AudioSystem.cpp \
+     mediaplayer.cpp \
+     IMediaCodecList.cpp \
+@@ -103,7 +106,7 @@ endif
+ LOCAL_SHARED_LIBRARIES := \
+ 	libui liblog libcutils libutils libbinder libsonivox libicuuc libicui18n libexpat \
+         libcamera_client libstagefright_foundation \
+-        libgui libdl libaudioutils libnbaio
++        libgui libdl libaudioutils libnbaio libpower
+ 
+ ifeq ($(BOARD_USES_QCOM_HARDWARE),true)
+ LOCAL_SHARED_LIBRARIES += \
+@@ -123,7 +126,10 @@ LOCAL_C_INCLUDES := \
+     $(TOP)/external/icu/icu4c/source/common \
+     $(TOP)/external/icu/icu4c/source/i18n \
+     $(call include-path-for, audio-effects) \
+-    $(call include-path-for, audio-utils)
++    $(call include-path-for, audio-utils) \
++    $(TOP)/ubuntu/libhybris/hybris/include \
++    $(TOP)/ubuntu/libhybris/compat/media \
++    $(TOP)/hardware/libhardware_legacy/include
+ 
+ include $(BUILD_SHARED_LIBRARY)
+ 
+diff --git a/media/libmedia/AudioRecordHybris.cpp b/media/libmedia/AudioRecordHybris.cpp
+new file mode 100644
+index 0000000..e59fe30
+--- /dev/null
++++ b/media/libmedia/AudioRecordHybris.cpp
+@@ -0,0 +1,1129 @@
++/*
++ *
++ * Copyright 2008, The Android Open Source Project
++ * Copyright (C) 2014 Canonical Ltd
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Authored by: Jim Hodapp <jim.hodapp@canonical.com>
++ */
++
++#define LOG_NDEBUG 0
++#define LOG_TAG "AudioRecordHybris"
++
++#include <inttypes.h>
++#include <sys/resource.h>
++
++#include <binder/IPCThreadState.h>
++#include <media/AudioRecord.h>
++#include <utils/Log.h>
++#include <private/media/AudioTrackShared.h>
++#include <media/IAudioFlinger.h>
++#include <media/camera_record_service.h>
++
++#define WAIT_PERIOD_MS          10
++
++namespace android {
++// ---------------------------------------------------------------------------
++
++// static
++status_t AudioRecord::getMinFrameCount(
++        size_t* frameCount,
++        uint32_t sampleRate,
++        audio_format_t format,
++        audio_channel_mask_t channelMask)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    if (frameCount == NULL) {
++        return BAD_VALUE;
++    }
++
++    size_t size;
++    status_t status = AudioSystem::getInputBufferSize(sampleRate, format, channelMask, &size);
++    if (status != NO_ERROR) {
++        ALOGE("AudioSystem could not query the input buffer size for sampleRate %u, format %#x, "
++              "channelMask %#x; status %d", sampleRate, format, channelMask, status);
++        return status;
++    }
++
++    // We double the size of input buffer for ping pong use of record buffer.
++    // Assumes audio_is_linear_pcm(format)
++    if ((*frameCount = (size * 2) / (audio_channel_count_from_in_mask(channelMask) *
++            audio_bytes_per_sample(format))) == 0) {
++        ALOGE("Unsupported configuration: sampleRate %u, format %#x, channelMask %#x",
++            sampleRate, format, channelMask);
++        return BAD_VALUE;
++    }
++
++    return NO_ERROR;
++}
++
++// ---------------------------------------------------------------------------
++
++AudioRecord::AudioRecord()
++    : mStatus(NO_INIT), mSessionId(AUDIO_SESSION_ALLOCATE),
++      mPreviousPriority(ANDROID_PRIORITY_NORMAL), mPreviousSchedulingGroup(SP_DEFAULT)
++{
++}
++
++AudioRecord::AudioRecord(
++        audio_source_t inputSource,
++        uint32_t sampleRate,
++        audio_format_t format,
++        audio_channel_mask_t channelMask,
++        size_t frameCount,
++        callback_t cbf,
++        void* user,
++        uint32_t notificationFrames,
++        int sessionId,
++        transfer_type transferType,
++        audio_input_flags_t flags,
++        const audio_attributes_t* pAttributes)
++    : mStatus(NO_INIT), mSessionId(AUDIO_SESSION_ALLOCATE),
++      mPreviousPriority(ANDROID_PRIORITY_NORMAL),
++      mPreviousSchedulingGroup(SP_DEFAULT),
++      mProxy(NULL)
++{
++    ALOGD("%s", __PRETTY_FUNCTION__);
++    mStatus = set(inputSource, sampleRate, format, channelMask, frameCount, cbf, user,
++            notificationFrames, false /*threadCanCallJava*/, sessionId, transferType, flags,
++            pAttributes);
++}
++
++AudioRecord::~AudioRecord()
++{
++    ALOGD("%s", __PRETTY_FUNCTION__);
++    if (mStatus == NO_ERROR) {
++        // Make sure that callback function exits in the case where
++        // it is looping on buffer empty condition in obtainBuffer().
++        // Otherwise the callback thread will never exit.
++        stop();
++        if (mAudioRecordThread != 0) {
++            mProxy->interrupt();
++            mAudioRecordThread->requestExit();  // see comment in AudioRecord.h
++            mAudioRecordThread->requestExitAndWait();
++            mAudioRecordThread.clear();
++        }
++        mAudioRecord->asBinder()->unlinkToDeath(mDeathNotifier, this);
++        mAudioRecord.clear();
++        mCblkMemory.clear();
++        mBufferMemory.clear();
++        IPCThreadState::self()->flushCommands();
++    }
++}
++
++status_t AudioRecord::set(
++        audio_source_t inputSource,
++        uint32_t sampleRate,
++        audio_format_t format,
++        audio_channel_mask_t channelMask,
++        size_t frameCount,
++        callback_t cbf,
++        void* user,
++        uint32_t notificationFrames,
++        bool threadCanCallJava,
++        int sessionId,
++        transfer_type transferType,
++        audio_input_flags_t flags,
++        const audio_attributes_t* pAttributes)
++{
++    ALOGV("set(): inputSource %d, sampleRate %u, format %#x, channelMask %#x, frameCount %zu, "
++          "notificationFrames %u, sessionId %d, transferType %d, flags %#x",
++          inputSource, sampleRate, format, channelMask, frameCount, notificationFrames,
++          sessionId, transferType, flags);
++
++    switch (transferType) {
++    case TRANSFER_DEFAULT:
++        if (cbf == NULL || threadCanCallJava) {
++            transferType = TRANSFER_SYNC;
++        } else {
++            transferType = TRANSFER_CALLBACK;
++        }
++        break;
++    case TRANSFER_CALLBACK:
++        if (cbf == NULL) {
++            ALOGE("Transfer type TRANSFER_CALLBACK but cbf == NULL");
++            return BAD_VALUE;
++        }
++        break;
++    case TRANSFER_OBTAIN:
++    case TRANSFER_SYNC:
++        break;
++    default:
++        ALOGE("Invalid transfer type %d", transferType);
++        return BAD_VALUE;
++    }
++    mTransfer = transferType;
++
++    AutoMutex lock(mLock);
++
++    // invariant that mAudioRecord != 0 is true only after set() returns successfully
++    if (mAudioRecord != 0) {
++        ALOGE("Track already in use");
++        return INVALID_OPERATION;
++    }
++
++    if (pAttributes == NULL) {
++        memset(&mAttributes, 0, sizeof(audio_attributes_t));
++        mAttributes.source = inputSource;
++    } else {
++        // stream type shouldn't be looked at, this track has audio attributes
++        memcpy(&mAttributes, pAttributes, sizeof(audio_attributes_t));
++        ALOGV("Building AudioRecord with attributes: source=%d flags=0x%x tags=[%s]",
++              mAttributes.source, mAttributes.flags, mAttributes.tags);
++    }
++
++    if (sampleRate == 0) {
++        ALOGE("Invalid sample rate %u", sampleRate);
++        return BAD_VALUE;
++    }
++    mSampleRate = sampleRate;
++
++    // these below should probably come from the audioFlinger too...
++    if (format == AUDIO_FORMAT_DEFAULT) {
++        format = AUDIO_FORMAT_PCM_16_BIT;
++    }
++
++    // validate parameters
++    if (!audio_is_valid_format(format)) {
++        ALOGE("Invalid format %#x", format);
++        return BAD_VALUE;
++    }
++    // Temporary restriction: AudioFlinger currently supports 16-bit PCM only
++    if (format != AUDIO_FORMAT_PCM_16_BIT) {
++        ALOGE("Format %#x is not supported", format);
++        return BAD_VALUE;
++    }
++    mFormat = format;
++
++    if (!audio_is_input_channel(channelMask)) {
++        ALOGE("Invalid channel mask %#x", channelMask);
++        return BAD_VALUE;
++    }
++    mChannelMask = channelMask;
++    uint32_t channelCount = audio_channel_count_from_in_mask(channelMask);
++    mChannelCount = channelCount;
++
++    if (audio_is_linear_pcm(format)) {
++        mFrameSize = channelCount * audio_bytes_per_sample(format);
++    } else {
++        mFrameSize = sizeof(uint8_t);
++    }
++
++    // mFrameCount is initialized in openRecord_l
++    mReqFrameCount = frameCount;
++
++    mNotificationFramesReq = notificationFrames;
++    // mNotificationFramesAct is initialized in openRecord_l
++
++    if (sessionId == AUDIO_SESSION_ALLOCATE) {
++        mSessionId = AudioSystem::newAudioUniqueId();
++    } else {
++        mSessionId = sessionId;
++    }
++    ALOGV("set(): mSessionId %d", mSessionId);
++
++    mFlags = flags;
++    mCbf = cbf;
++
++    if (cbf != NULL) {
++        mAudioRecordThread = new AudioRecordThread(*this, threadCanCallJava);
++        mAudioRecordThread->run("AudioRecord", ANDROID_PRIORITY_AUDIO);
++    }
++
++    // create the IAudioRecord
++    status_t status = openRecord_l(0 /*epoch*/);
++
++    if (status != NO_ERROR) {
++        if (mAudioRecordThread != 0) {
++            mAudioRecordThread->requestExit();   // see comment in AudioRecord.h
++            mAudioRecordThread->requestExitAndWait();
++            mAudioRecordThread.clear();
++        }
++        return status;
++    }
++
++    mStatus = NO_ERROR;
++    mActive = false;
++    mUserData = user;
++    // TODO: add audio hardware input latency here
++    mLatency = (1000*mFrameCount) / sampleRate;
++    mMarkerPosition = 0;
++    mMarkerReached = false;
++    mNewPosition = 0;
++    mUpdatePeriod = 0;
++    mSequence = 1;
++    mObservedSequence = mSequence;
++    mInOverrun = false;
++
++    return NO_ERROR;
++}
++
++// -------------------------------------------------------------------------
++
++status_t AudioRecord::start(AudioSystem::sync_event_t event, int triggerSession)
++{
++    ALOGV("start, sync event %d trigger session %d", event, triggerSession);
++
++    AutoMutex lock(mLock);
++    if (mActive) {
++        return NO_ERROR;
++    }
++
++    // reset current position as seen by client to 0
++    mProxy->setEpoch(mProxy->getEpoch() - mProxy->getPosition());
++    // force refresh of remaining frames by processAudioBuffer() as last
++    // read before stop could be partial.
++    mRefreshRemaining = true;
++
++    mNewPosition = mProxy->getPosition() + mUpdatePeriod;
++    int32_t flags = android_atomic_acquire_load(&mCblk->mFlags);
++
++    status_t status = NO_ERROR;
++    if (!(flags & CBLK_INVALID)) {
++        status = mAudioRecord->start(event, triggerSession);
++        if (status == DEAD_OBJECT) {
++            flags |= CBLK_INVALID;
++        }
++    }
++    if (flags & CBLK_INVALID) {
++        status = restoreRecord_l("start");
++    }
++
++    if (status != NO_ERROR) {
++        ALOGE("start() status %d", status);
++    } else {
++        mActive = true;
++        sp<AudioRecordThread> t = mAudioRecordThread;
++        if (t != 0) {
++            t->resume();
++        } else {
++            mPreviousPriority = getpriority(PRIO_PROCESS, 0);
++            get_sched_policy(0, &mPreviousSchedulingGroup);
++            androidSetThreadPriority(0, ANDROID_PRIORITY_AUDIO);
++        }
++    }
++
++    return status;
++}
++
++void AudioRecord::stop()
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    AutoMutex lock(mLock);
++    if (!mActive) {
++        return;
++    }
++
++    mActive = false;
++    mProxy->interrupt();
++    mAudioRecord->stop();
++    // the record head position will reset to 0, so if a marker is set, we need
++    // to activate it again
++    mMarkerReached = false;
++    sp<AudioRecordThread> t = mAudioRecordThread;
++    if (t != 0) {
++        t->pause();
++    } else {
++        setpriority(PRIO_PROCESS, 0, mPreviousPriority);
++        set_sched_policy(0, mPreviousSchedulingGroup);
++    }
++}
++
++bool AudioRecord::stopped() const
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    AutoMutex lock(mLock);
++    return !mActive;
++}
++
++status_t AudioRecord::setMarkerPosition(uint32_t marker)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    // The only purpose of setting marker position is to get a callback
++    if (mCbf == NULL) {
++        return INVALID_OPERATION;
++    }
++
++    AutoMutex lock(mLock);
++    mMarkerPosition = marker;
++    mMarkerReached = false;
++
++    return NO_ERROR;
++}
++
++status_t AudioRecord::getMarkerPosition(uint32_t *marker) const
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    if (marker == NULL) {
++        return BAD_VALUE;
++    }
++
++    AutoMutex lock(mLock);
++    *marker = mMarkerPosition;
++
++    return NO_ERROR;
++}
++
++status_t AudioRecord::setPositionUpdatePeriod(uint32_t updatePeriod)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    // The only purpose of setting position update period is to get a callback
++    if (mCbf == NULL) {
++        return INVALID_OPERATION;
++    }
++
++    AutoMutex lock(mLock);
++    mNewPosition = mProxy->getPosition() + updatePeriod;
++    mUpdatePeriod = updatePeriod;
++
++    return NO_ERROR;
++}
++
++status_t AudioRecord::getPositionUpdatePeriod(uint32_t *updatePeriod) const
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    if (updatePeriod == NULL) {
++        return BAD_VALUE;
++    }
++
++    AutoMutex lock(mLock);
++    *updatePeriod = mUpdatePeriod;
++
++    return NO_ERROR;
++}
++
++status_t AudioRecord::getPosition(uint32_t *position) const
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    if (position == NULL) {
++        return BAD_VALUE;
++    }
++
++    AutoMutex lock(mLock);
++    *position = mProxy->getPosition();
++
++    return NO_ERROR;
++}
++
++uint32_t AudioRecord::getInputFramesLost() const
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    // no need to check mActive, because if inactive this will return 0, which is what we want
++    return AudioSystem::getInputFramesLost(getInput());
++}
++
++// -------------------------------------------------------------------------
++
++// must be called with mLock held
++status_t AudioRecord::openRecord_l(size_t epoch)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    status_t status;
++    // Get an instance of the CameraRecordInstance over Binder
++    const sp<ICameraRecordService>& recordService = AudioSystem::get_camera_record_service();
++    if (recordService == 0) {
++        ALOGE("Could not get CameraRecordService");
++        return NO_INIT;
++    }
++
++    // Fast tracks must be at the primary _output_ [sic] sampling rate,
++    // because there is currently no concept of a primary input sampling rate
++    uint32_t afSampleRate = AudioSystem::getPrimaryOutputSamplingRate();
++    if (afSampleRate == 0) {
++        ALOGW("getPrimaryOutputSamplingRate failed");
++    }
++
++    // Client can only express a preference for FAST.  Server will perform additional tests.
++    if ((mFlags & AUDIO_INPUT_FLAG_FAST) && !(
++            // use case: callback transfer mode
++            (mTransfer == TRANSFER_CALLBACK) &&
++            // matching sample rate
++            (mSampleRate == afSampleRate))) {
++        ALOGW("AUDIO_INPUT_FLAG_FAST denied by client");
++        // once denied, do not request again if IAudioRecord is re-created
++        mFlags = (audio_input_flags_t) (mFlags & ~AUDIO_INPUT_FLAG_FAST);
++    }
++
++    IAudioFlinger::track_flags_t trackFlags = IAudioFlinger::TRACK_DEFAULT;
++
++    pid_t tid = -1;
++    if (mFlags & AUDIO_INPUT_FLAG_FAST) {
++        trackFlags |= IAudioFlinger::TRACK_FAST;
++        if (mAudioRecordThread != 0) {
++            tid = mAudioRecordThread->getTid();
++        }
++    }
++
++    // Initialize the input reader RecordThread:
++    status = recordService->initRecord(mSampleRate, mFormat, mChannelMask);
++    if (status != NO_ERROR) {
++        ALOGE("Failed to initialize RecordThread: %s", strerror(status));
++        return status;
++    }
++    {
++    // Now that we have a reference to an I/O handle and have not yet handed it off to AudioFlinger,
++    // we must release it ourselves if anything goes wrong.
++
++    int originalSessionId = mSessionId;
++    sp<IAudioRecord> record = recordService->openRecord(mSampleRate, mFormat,
++                                                       mChannelMask,
++                                                       mFrameCount,
++                                                       tid,
++                                                       &mSessionId,
++                                                       &status);
++
++    ALOGE_IF(originalSessionId != AUDIO_SESSION_ALLOCATE && mSessionId != originalSessionId,
++            "session ID changed from %d to %d", originalSessionId, mSessionId);
++
++    if (record == 0 || status != NO_ERROR) {
++        ALOGE("CameraRecordService could not create record track, status: %d", status);
++        goto release;
++    }
++    ALOG_ASSERT(record != 0);
++
++//     sp<IMemory> iMem = record->getCblk();
++//
++//     // AudioFlinger now owns the reference to the I/O handle,
++//     // so we are no longer responsible for releasing it.
++//
++//     if (iMem == 0) {
++//         ALOGE("Could not get control block");
++//         return NO_INIT;
++//     }
++//     void *iMemPointer = iMem->pointer();
++//     if (iMemPointer == NULL) {
++//         ALOGE("Could not get control block pointer");
++//         return NO_INIT;
++//     }
++//     audio_track_cblk_t* cblk = static_cast<audio_track_cblk_t*>(iMemPointer);
++//
++//     // Starting address of buffers in shared memory.
++//     // The buffers are either immediately after the control block,
++//     // or in a separate area at discretion of server.
++//     void *buffers;
++//     if (bufferMem == 0) {
++//         buffers = cblk + 1;
++//     } else {
++//         buffers = bufferMem->pointer();
++//         if (buffers == NULL) {
++//             ALOGE("Could not get buffer pointer");
++//             return NO_INIT;
++//         }
++//     }
++//
++//     // invariant that mAudioRecord != 0 is true only after set() returns successfully
++//     if (mAudioRecord != 0) {
++//         mAudioRecord->asBinder()->unlinkToDeath(mDeathNotifier, this);
++//         mDeathNotifier.clear();
++//     }
++//     mAudioRecord = record;
++//     mCblkMemory = iMem;
++//     mBufferMemory = bufferMem;
++//     IPCThreadState::self()->flushCommands();
++//
++//     mCblk = cblk;
++//     // note that temp is the (possibly revised) value of frameCount
++//     if (temp < frameCount || (frameCount == 0 && temp == 0)) {
++//         ALOGW("Requested frameCount %zu but received frameCount %zu", frameCount, temp);
++//     }
++//     frameCount = temp;
++//
++//     mAwaitBoost = false;
++//     if (mFlags & AUDIO_INPUT_FLAG_FAST) {
++//         if (trackFlags & IAudioFlinger::TRACK_FAST) {
++//             ALOGV("AUDIO_INPUT_FLAG_FAST successful; frameCount %zu", frameCount);
++//             mAwaitBoost = true;
++//         } else {
++//             ALOGV("AUDIO_INPUT_FLAG_FAST denied by server; frameCount %zu", frameCount);
++//             // once denied, do not request again if IAudioRecord is re-created
++//             mFlags = (audio_input_flags_t) (mFlags & ~AUDIO_INPUT_FLAG_FAST);
++//         }
++//     }
++//
++//     // Make sure that application is notified with sufficient margin before overrun
++//     if (notificationFrames == 0 || notificationFrames > frameCount) {
++//         ALOGW("Received notificationFrames %zu for frameCount %zu", notificationFrames, frameCount);
++//     }
++//     mNotificationFramesAct = notificationFrames;
++//
++//     // We retain a copy of the I/O handle, but don't own the reference
++//     mInput = input;
++//     mRefreshRemaining = true;
++//
++//     mFrameCount = frameCount;
++//     // If IAudioRecord is re-created, don't let the requested frameCount
++//     // decrease.  This can confuse clients that cache frameCount().
++//     if (frameCount > mReqFrameCount) {
++//         mReqFrameCount = frameCount;
++//     }
++//
++//     // update proxy
++//     mProxy = new AudioRecordClientProxy(cblk, buffers, mFrameCount, mFrameSize);
++//     mProxy->setEpoch(epoch);
++//     mProxy->setMinimum(mNotificationFramesAct);
++//
++//     mDeathNotifier = new DeathNotifier(this);
++//     mAudioRecord->asBinder()->linkToDeath(mDeathNotifier, this);
++
++    return NO_ERROR;
++    }
++
++release:
++//    AudioSystem::releaseInput(input, (audio_session_t)mSessionId);
++    if (status == NO_ERROR) {
++        status = NO_INIT;
++    }
++    return status;
++}
++
++status_t AudioRecord::obtainBuffer(Buffer* audioBuffer, int32_t waitCount)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    if (audioBuffer == NULL) {
++        return BAD_VALUE;
++    }
++    if (mTransfer != TRANSFER_OBTAIN) {
++        audioBuffer->frameCount = 0;
++        audioBuffer->size = 0;
++        audioBuffer->raw = NULL;
++        return INVALID_OPERATION;
++    }
++
++    const struct timespec *requested;
++    struct timespec timeout;
++    if (waitCount == -1) {
++        requested = &ClientProxy::kForever;
++    } else if (waitCount == 0) {
++        requested = &ClientProxy::kNonBlocking;
++    } else if (waitCount > 0) {
++        long long ms = WAIT_PERIOD_MS * (long long) waitCount;
++        timeout.tv_sec = ms / 1000;
++        timeout.tv_nsec = (int) (ms % 1000) * 1000000;
++        requested = &timeout;
++    } else {
++        ALOGE("%s invalid waitCount %d", __func__, waitCount);
++        requested = NULL;
++    }
++    return obtainBuffer(audioBuffer, requested);
++}
++
++status_t AudioRecord::obtainBuffer(Buffer* audioBuffer, const struct timespec *requested,
++        struct timespec *elapsed, size_t *nonContig)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    // previous and new IAudioRecord sequence numbers are used to detect track re-creation
++    uint32_t oldSequence = 0;
++    uint32_t newSequence;
++
++    Proxy::Buffer buffer;
++    status_t status = NO_ERROR;
++
++    static const int32_t kMaxTries = 5;
++    int32_t tryCounter = kMaxTries;
++
++    do {
++        // obtainBuffer() is called with mutex unlocked, so keep extra references to these fields to
++        // keep them from going away if another thread re-creates the track during obtainBuffer()
++        sp<AudioRecordClientProxy> proxy;
++        sp<IMemory> iMem;
++        sp<IMemory> bufferMem;
++        {
++            // start of lock scope
++            AutoMutex lock(mLock);
++
++            newSequence = mSequence;
++            // did previous obtainBuffer() fail due to media server death or voluntary invalidation?
++            if (status == DEAD_OBJECT) {
++                // re-create track, unless someone else has already done so
++                if (newSequence == oldSequence) {
++                    status = restoreRecord_l("obtainBuffer");
++                    if (status != NO_ERROR) {
++                        buffer.mFrameCount = 0;
++                        buffer.mRaw = NULL;
++                        buffer.mNonContig = 0;
++                        break;
++                    }
++                }
++            }
++            oldSequence = newSequence;
++
++            // Keep the extra references
++            proxy = mProxy;
++            iMem = mCblkMemory;
++            bufferMem = mBufferMemory;
++
++            // Non-blocking if track is stopped
++            if (!mActive) {
++                requested = &ClientProxy::kNonBlocking;
++            }
++
++        }   // end of lock scope
++
++        buffer.mFrameCount = audioBuffer->frameCount;
++        // FIXME starts the requested timeout and elapsed over from scratch
++        status = proxy->obtainBuffer(&buffer, requested, elapsed);
++
++    } while ((status == DEAD_OBJECT) && (tryCounter-- > 0));
++
++    audioBuffer->frameCount = buffer.mFrameCount;
++    audioBuffer->size = buffer.mFrameCount * mFrameSize;
++    audioBuffer->raw = buffer.mRaw;
++    if (nonContig != NULL) {
++        *nonContig = buffer.mNonContig;
++    }
++    return status;
++}
++
++void AudioRecord::releaseBuffer(Buffer* audioBuffer)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    // all TRANSFER_* are valid
++
++    size_t stepCount = audioBuffer->size / mFrameSize;
++    if (stepCount == 0) {
++        return;
++    }
++
++    Proxy::Buffer buffer;
++    buffer.mFrameCount = stepCount;
++    buffer.mRaw = audioBuffer->raw;
++
++    AutoMutex lock(mLock);
++    mInOverrun = false;
++    mProxy->releaseBuffer(&buffer);
++
++    // the server does not automatically disable recorder on overrun, so no need to restart
++}
++
++audio_io_handle_t AudioRecord::getInput() const
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    AutoMutex lock(mLock);
++    return mInput;
++}
++
++// -------------------------------------------------------------------------
++
++ssize_t AudioRecord::read(void* buffer, size_t userSize)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    if (mTransfer != TRANSFER_SYNC) {
++        return INVALID_OPERATION;
++    }
++
++    if (ssize_t(userSize) < 0 || (buffer == NULL && userSize != 0)) {
++        // sanity-check. user is most-likely passing an error code, and it would
++        // make the return value ambiguous (actualSize vs error).
++        ALOGE("AudioRecord::read(buffer=%p, size=%zu (%zu)", buffer, userSize, userSize);
++        return BAD_VALUE;
++    }
++
++    ssize_t read = 0;
++    Buffer audioBuffer;
++
++    while (userSize >= mFrameSize) {
++        audioBuffer.frameCount = userSize / mFrameSize;
++
++        status_t err = obtainBuffer(&audioBuffer, &ClientProxy::kForever);
++        if (err < 0) {
++            if (read > 0) {
++                break;
++            }
++            return ssize_t(err);
++        }
++
++        size_t bytesRead = audioBuffer.size;
++        memcpy(buffer, audioBuffer.i8, bytesRead);
++        buffer = ((char *) buffer) + bytesRead;
++        userSize -= bytesRead;
++        read += bytesRead;
++
++        releaseBuffer(&audioBuffer);
++    }
++
++    return read;
++}
++
++// -------------------------------------------------------------------------
++
++nsecs_t AudioRecord::processAudioBuffer()
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    mLock.lock();
++    if (mAwaitBoost) {
++        mAwaitBoost = false;
++        mLock.unlock();
++        static const int32_t kMaxTries = 5;
++        int32_t tryCounter = kMaxTries;
++        uint32_t pollUs = 10000;
++        do {
++            int policy = sched_getscheduler(0);
++            if (policy == SCHED_FIFO || policy == SCHED_RR) {
++                break;
++            }
++            usleep(pollUs);
++            pollUs <<= 1;
++        } while (tryCounter-- > 0);
++        if (tryCounter < 0) {
++            ALOGE("did not receive expected priority boost on time");
++        }
++        // Run again immediately
++        return 0;
++    }
++
++    // Can only reference mCblk while locked
++    int32_t flags = android_atomic_and(~CBLK_OVERRUN, &mCblk->mFlags);
++
++    // Check for track invalidation
++    if (flags & CBLK_INVALID) {
++        (void) restoreRecord_l("processAudioBuffer");
++        mLock.unlock();
++        // Run again immediately, but with a new IAudioRecord
++        return 0;
++    }
++
++    bool active = mActive;
++
++    // Manage overrun callback, must be done under lock to avoid race with releaseBuffer()
++    bool newOverrun = false;
++    if (flags & CBLK_OVERRUN) {
++        if (!mInOverrun) {
++            mInOverrun = true;
++            newOverrun = true;
++        }
++    }
++
++    // Get current position of server (units in frames)
++    size_t position = mProxy->getPosition();
++
++    // Manage marker callback
++    bool markerReached = false;
++    size_t markerPosition = mMarkerPosition;
++    // FIXME fails for wraparound, need 64 bits
++    if (!mMarkerReached && (markerPosition > 0) && (position >= markerPosition)) {
++        mMarkerReached = markerReached = true;
++    }
++
++    // Determine the number of new position callback(s) that will be needed, while locked
++    size_t newPosCount = 0;
++    size_t newPosition = mNewPosition;
++    uint32_t updatePeriod = mUpdatePeriod;
++    // FIXME fails for wraparound, need 64 bits
++    if (updatePeriod > 0 && position >= newPosition) {
++        newPosCount = ((position - newPosition) / updatePeriod) + 1;
++        mNewPosition += updatePeriod * newPosCount;
++    }
++
++    // Cache other fields that will be needed soon
++    uint32_t notificationFrames = mNotificationFramesAct;
++    if (mRefreshRemaining) {
++        mRefreshRemaining = false;
++        mRemainingFrames = notificationFrames;
++        mRetryOnPartialBuffer = false;
++    }
++    size_t misalignment = mProxy->getMisalignment();
++    uint32_t sequence = mSequence;
++
++    // These fields don't need to be cached, because they are assigned only by set():
++    //      mTransfer, mCbf, mUserData, mSampleRate, mFrameSize
++
++    mLock.unlock();
++
++    // perform callbacks while unlocked
++    if (newOverrun) {
++        mCbf(EVENT_OVERRUN, mUserData, NULL);
++    }
++    if (markerReached) {
++        mCbf(EVENT_MARKER, mUserData, &markerPosition);
++    }
++    while (newPosCount > 0) {
++        size_t temp = newPosition;
++        mCbf(EVENT_NEW_POS, mUserData, &temp);
++        newPosition += updatePeriod;
++        newPosCount--;
++    }
++    if (mObservedSequence != sequence) {
++        mObservedSequence = sequence;
++        mCbf(EVENT_NEW_IAUDIORECORD, mUserData, NULL);
++    }
++
++    // if inactive, then don't run me again until re-started
++    if (!active) {
++        return NS_INACTIVE;
++    }
++
++    // Compute the estimated time until the next timed event (position, markers)
++    uint32_t minFrames = ~0;
++    if (!markerReached && position < markerPosition) {
++        minFrames = markerPosition - position;
++    }
++    if (updatePeriod > 0 && updatePeriod < minFrames) {
++        minFrames = updatePeriod;
++    }
++
++    // If > 0, poll periodically to recover from a stuck server.  A good value is 2.
++    static const uint32_t kPoll = 0;
++    if (kPoll > 0 && mTransfer == TRANSFER_CALLBACK && kPoll * notificationFrames < minFrames) {
++        minFrames = kPoll * notificationFrames;
++    }
++
++    // Convert frame units to time units
++    nsecs_t ns = NS_WHENEVER;
++    if (minFrames != (uint32_t) ~0) {
++        // This "fudge factor" avoids soaking CPU, and compensates for late progress by server
++        static const nsecs_t kFudgeNs = 10000000LL; // 10 ms
++        ns = ((minFrames * 1000000000LL) / mSampleRate) + kFudgeNs;
++    }
++
++    // If not supplying data by EVENT_MORE_DATA, then we're done
++    if (mTransfer != TRANSFER_CALLBACK) {
++        return ns;
++    }
++
++    struct timespec timeout;
++    const struct timespec *requested = &ClientProxy::kForever;
++    if (ns != NS_WHENEVER) {
++        timeout.tv_sec = ns / 1000000000LL;
++        timeout.tv_nsec = ns % 1000000000LL;
++        ALOGV("timeout %ld.%03d", timeout.tv_sec, (int) timeout.tv_nsec / 1000000);
++        requested = &timeout;
++    }
++
++    while (mRemainingFrames > 0) {
++
++        Buffer audioBuffer;
++        audioBuffer.frameCount = mRemainingFrames;
++        size_t nonContig;
++        status_t err = obtainBuffer(&audioBuffer, requested, NULL, &nonContig);
++        LOG_ALWAYS_FATAL_IF((err != NO_ERROR) != (audioBuffer.frameCount == 0),
++                "obtainBuffer() err=%d frameCount=%zu", err, audioBuffer.frameCount);
++        requested = &ClientProxy::kNonBlocking;
++        size_t avail = audioBuffer.frameCount + nonContig;
++        ALOGV("obtainBuffer(%u) returned %zu = %zu + %zu err %d",
++                mRemainingFrames, avail, audioBuffer.frameCount, nonContig, err);
++        if (err != NO_ERROR) {
++            if (err == TIMED_OUT || err == WOULD_BLOCK || err == -EINTR) {
++                break;
++            }
++            ALOGE("Error %d obtaining an audio buffer, giving up.", err);
++            return NS_NEVER;
++        }
++
++        if (mRetryOnPartialBuffer) {
++            mRetryOnPartialBuffer = false;
++            if (avail < mRemainingFrames) {
++                int64_t myns = ((mRemainingFrames - avail) *
++                        1100000000LL) / mSampleRate;
++                if (ns < 0 || myns < ns) {
++                    ns = myns;
++                }
++                return ns;
++            }
++        }
++
++        size_t reqSize = audioBuffer.size;
++        mCbf(EVENT_MORE_DATA, mUserData, &audioBuffer);
++        size_t readSize = audioBuffer.size;
++
++        // Sanity check on returned size
++        if (ssize_t(readSize) < 0 || readSize > reqSize) {
++            ALOGE("EVENT_MORE_DATA requested %zu bytes but callback returned %zd bytes",
++                    reqSize, ssize_t(readSize));
++            return NS_NEVER;
++        }
++
++        if (readSize == 0) {
++            // The callback is done consuming buffers
++            // Keep this thread going to handle timed events and
++            // still try to provide more data in intervals of WAIT_PERIOD_MS
++            // but don't just loop and block the CPU, so wait
++            return WAIT_PERIOD_MS * 1000000LL;
++        }
++
++        size_t releasedFrames = readSize / mFrameSize;
++        audioBuffer.frameCount = releasedFrames;
++        mRemainingFrames -= releasedFrames;
++        if (misalignment >= releasedFrames) {
++            misalignment -= releasedFrames;
++        } else {
++            misalignment = 0;
++        }
++
++        releaseBuffer(&audioBuffer);
++
++        // FIXME here is where we would repeat EVENT_MORE_DATA again on same advanced buffer
++        // if callback doesn't like to accept the full chunk
++        if (readSize < reqSize) {
++            continue;
++        }
++
++        // There could be enough non-contiguous frames available to satisfy the remaining request
++        if (mRemainingFrames <= nonContig) {
++            continue;
++        }
++
++#if 0
++        // This heuristic tries to collapse a series of EVENT_MORE_DATA that would total to a
++        // sum <= notificationFrames.  It replaces that series by at most two EVENT_MORE_DATA
++        // that total to a sum == notificationFrames.
++        if (0 < misalignment && misalignment <= mRemainingFrames) {
++            mRemainingFrames = misalignment;
++            return (mRemainingFrames * 1100000000LL) / mSampleRate;
++        }
++#endif
++
++    }
++    mRemainingFrames = notificationFrames;
++    mRetryOnPartialBuffer = true;
++
++    // A lot has transpired since ns was calculated, so run again immediately and re-calculate
++    return 0;
++}
++
++status_t AudioRecord::restoreRecord_l(const char *from)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    ALOGW("dead IAudioRecord, creating a new one from %s()", from);
++    ++mSequence;
++    status_t result;
++
++    // if the new IAudioRecord is created, openRecord_l() will modify the
++    // following member variables: mAudioRecord, mCblkMemory, mCblk, mBufferMemory.
++    // It will also delete the strong references on previous IAudioRecord and IMemory
++    size_t position = mProxy->getPosition();
++    mNewPosition = position + mUpdatePeriod;
++    result = openRecord_l(position);
++    if (result == NO_ERROR) {
++        if (mActive) {
++            // callback thread or sync event hasn't changed
++            // FIXME this fails if we have a new AudioFlinger instance
++            result = mAudioRecord->start(AudioSystem::SYNC_EVENT_SAME, 0);
++        }
++    }
++    if (result != NO_ERROR) {
++        ALOGW("restoreRecord_l() failed status %d", result);
++        mActive = false;
++    }
++
++    return result;
++}
++
++// =========================================================================
++
++void AudioRecord::DeathNotifier::binderDied(const wp<IBinder>& who __unused)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    sp<AudioRecord> audioRecord = mAudioRecord.promote();
++    if (audioRecord != 0) {
++        AutoMutex lock(audioRecord->mLock);
++        audioRecord->mProxy->binderDied();
++    }
++}
++
++// =========================================================================
++
++AudioRecord::AudioRecordThread::AudioRecordThread(AudioRecord& receiver, bool bCanCallJava)
++    : Thread(bCanCallJava), mReceiver(receiver), mPaused(true), mPausedInt(false), mPausedNs(0LL),
++      mIgnoreNextPausedInt(false)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++}
++
++AudioRecord::AudioRecordThread::~AudioRecordThread()
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++}
++
++bool AudioRecord::AudioRecordThread::threadLoop()
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    {
++        AutoMutex _l(mMyLock);
++        if (mPaused) {
++            mMyCond.wait(mMyLock);
++            // caller will check for exitPending()
++            return true;
++        }
++        if (mIgnoreNextPausedInt) {
++            mIgnoreNextPausedInt = false;
++            mPausedInt = false;
++        }
++        if (mPausedInt) {
++            if (mPausedNs > 0) {
++                (void) mMyCond.waitRelative(mMyLock, mPausedNs);
++            } else {
++                mMyCond.wait(mMyLock);
++            }
++            mPausedInt = false;
++            return true;
++        }
++    }
++    nsecs_t ns =  mReceiver.processAudioBuffer();
++    switch (ns) {
++    case 0:
++        return true;
++    case NS_INACTIVE:
++        pauseInternal();
++        return true;
++    case NS_NEVER:
++        return false;
++    case NS_WHENEVER:
++        // FIXME increase poll interval, or make event-driven
++        ns = 1000000000LL;
++        // fall through
++    default:
++        LOG_ALWAYS_FATAL_IF(ns < 0, "processAudioBuffer() returned %" PRId64, ns);
++        pauseInternal(ns);
++        return true;
++    }
++}
++
++void AudioRecord::AudioRecordThread::requestExit()
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    // must be in this order to avoid a race condition
++    Thread::requestExit();
++    resume();
++}
++
++void AudioRecord::AudioRecordThread::pause()
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    AutoMutex _l(mMyLock);
++    mPaused = true;
++}
++
++void AudioRecord::AudioRecordThread::resume()
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    AutoMutex _l(mMyLock);
++    mIgnoreNextPausedInt = true;
++    if (mPaused || mPausedInt) {
++        mPaused = false;
++        mPausedInt = false;
++        mMyCond.signal();
++    }
++}
++
++void AudioRecord::AudioRecordThread::pauseInternal(nsecs_t ns)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    AutoMutex _l(mMyLock);
++    mPausedInt = true;
++    mPausedNs = ns;
++}
++
++// -------------------------------------------------------------------------
++
++}; // namespace android
+diff --git a/media/libmedia/AudioSystem.cpp b/media/libmedia/AudioSystem.cpp
+index 9cae21c..d2aea61 100644
+--- a/media/libmedia/AudioSystem.cpp
++++ b/media/libmedia/AudioSystem.cpp
+@@ -21,6 +21,7 @@
+ #include <binder/IServiceManager.h>
+ #include <media/AudioSystem.h>
+ #include <media/IAudioFlinger.h>
++#include <media/camera_record_service.h>
+ #include <media/IAudioPolicyService.h>
+ #include <math.h>
+ 
+@@ -36,6 +37,7 @@ Mutex AudioSystem::gLockCache;
+ Mutex AudioSystem::gLockAPS;
+ Mutex AudioSystem::gLockAPC;
+ sp<IAudioFlinger> AudioSystem::gAudioFlinger;
++sp<ICameraRecordService> AudioSystem::gCameraRecord;
+ sp<AudioSystem::AudioFlingerClient> AudioSystem::gAudioFlingerClient;
+ audio_error_callback AudioSystem::gAudioErrorCallback = NULL;
+ 
+@@ -56,6 +58,7 @@ const sp<IAudioFlinger> AudioSystem::get_audio_flinger()
+     sp<IAudioFlinger> af;
+     sp<AudioFlingerClient> afc;
+     {
++    ALOGV("%s", __PRETTY_FUNCTION__);
+         Mutex::Autolock _l(gLock);
+         if (gAudioFlinger == 0) {
+             sp<IServiceManager> sm = defaultServiceManager();
+@@ -87,8 +90,30 @@ const sp<IAudioFlinger> AudioSystem::get_audio_flinger()
+     return af;
+ }
+ 
++const sp<ICameraRecordService>& AudioSystem::get_camera_record_service()
++{
++    Mutex::Autolock _l(gLock);
++    if (gCameraRecord == 0) {
++        sp<IServiceManager> sm = defaultServiceManager();
++        sp<IBinder> binder;
++        do {
++            // Connect to the CameraRecordService service
++            binder = sm->getService(String16(CameraRecordService::exported_service_name()));
++            if (binder != 0)
++                break;
++            ALOGW("CameraRecordService not published, waiting...");
++            usleep(500000); // 0.5 s
++        } while (true);
++        gCameraRecord = interface_cast<ICameraRecordService>(binder);
++    }
++    ALOGE_IF(gCameraRecord==0, "no CameraRecordService!?");
++
++    return gCameraRecord;
++}
++
+ /* static */ status_t AudioSystem::checkAudioFlinger()
+ {
++    ALOGV("%s", __PRETTY_FUNCTION__);
+     if (defaultServiceManager()->checkService(String16("media.audio_flinger")) != 0) {
+         return NO_ERROR;
+     }
+@@ -363,20 +388,72 @@ status_t AudioSystem::getLatency(audio_io_handle_t output,
+     return NO_ERROR;
+ }
+ 
++static int check_input_parameters(uint32_t sample_rate,
++                                  audio_format_t format,
++                                  int channel_count)
++{
++    if (format != AUDIO_FORMAT_PCM_16_BIT) return -EINVAL;
++
++    if ((channel_count < 1) || (channel_count > 2)) return -EINVAL;
++
++    switch (sample_rate) {
++    case 8000:
++    case 11025:
++    case 12000:
++    case 16000:
++    case 22050:
++    case 24000:
++    case 32000:
++    case 44100:
++    case 48000:
++        break;
++    default:
++        return -EINVAL;
++    }
++
++    return 0;
++}
++
++#define AUDIO_CAPTURE_PERIOD_DURATION_MSEC 20
++/* Pulled in from hardware/qcom/audio/hal/audio_hw.c
++TODO: This should be further made generic for different
++      device types
++*/
++static size_t get_input_buffer_size(uint32_t sample_rate,
++                                    audio_format_t format,
++                                    int channel_count)
++{
++    ALOGV("%s", __PRETTY_FUNCTION__);
++    size_t size = 0;
++
++    if (check_input_parameters(sample_rate, format, channel_count) != 0)
++        return 0;
++
++    ALOGV("Checked the input params");
++    size = (sample_rate * AUDIO_CAPTURE_PERIOD_DURATION_MSEC) / 1000;
++    /* ToDo: should use frame_size computed based on the format and
++       channel_count here. */
++    size *= sizeof(short) * channel_count;
++
++    /* make sure the size is multiple of 64 */
++    size += 0x3f;
++    size &= ~0x3f;
++
++    return size;
++}
++
+ status_t AudioSystem::getInputBufferSize(uint32_t sampleRate, audio_format_t format,
+         audio_channel_mask_t channelMask, size_t* buffSize)
+ {
+-    const sp<IAudioFlinger>& af = AudioSystem::get_audio_flinger();
+-    if (af == 0) {
+-        return PERMISSION_DENIED;
+-    }
++    ALOGV("%s", __PRETTY_FUNCTION__);
+     Mutex::Autolock _l(gLockCache);
+     // Do we have a stale gInBufferSize or are we requesting the input buffer size for new values
+     size_t inBuffSize = gInBuffSize;
+     if ((inBuffSize == 0) || (sampleRate != gPrevInSamplingRate) || (format != gPrevInFormat)
+         || (channelMask != gPrevInChannelMask)) {
+         gLockCache.unlock();
+-        inBuffSize = af->getInputBufferSize(sampleRate, format, channelMask);
++        inBuffSize = get_input_buffer_size(sampleRate, format, popcount(channelMask));
++		ALOGV("%s: %ld", __PRETTY_FUNCTION__, inBuffSize);
+         gLockCache.lock();
+         if (inBuffSize == 0) {
+             ALOGE("AudioSystem::getInputBufferSize failed sampleRate %d format %#x channelMask %x",
+@@ -414,20 +491,16 @@ status_t AudioSystem::getRenderPosition(audio_io_handle_t output, uint32_t *halF
+ 
+ uint32_t AudioSystem::getInputFramesLost(audio_io_handle_t ioHandle)
+ {
+-    const sp<IAudioFlinger>& af = AudioSystem::get_audio_flinger();
++    ALOGV("%s: always returning 0", __PRETTY_FUNCTION__);
+     uint32_t result = 0;
+-    if (af == 0) return result;
+-    if (ioHandle == AUDIO_IO_HANDLE_NONE) return result;
+-
+-    result = af->getInputFramesLost(ioHandle);
+     return result;
+ }
+ 
++volatile int32_t AudioSystem::mNextUniqueId = 1;
++
+ audio_unique_id_t AudioSystem::newAudioUniqueId()
+ {
+-    const sp<IAudioFlinger>& af = AudioSystem::get_audio_flinger();
+-    if (af == 0) return AUDIO_UNIQUE_ID_ALLOCATE;
+-    return af->newAudioUniqueId();
++    return android_atomic_inc(&mNextUniqueId);
+ }
+ 
+ void AudioSystem::acquireAudioSessionId(int audioSession, pid_t pid)
+@@ -701,9 +774,8 @@ status_t AudioSystem::getInputForAttr(const audio_attributes_t *attr,
+                                 audio_channel_mask_t channelMask,
+                                 audio_input_flags_t flags)
+ {
+-    const sp<IAudioPolicyService>& aps = AudioSystem::get_audio_policy_service();
+-    if (aps == 0) return NO_INIT;
+-    return aps->getInputForAttr(attr, input, session, samplingRate, format, channelMask, flags);
++    ALOGV("Returning a static audio_io_handle_t == 1");
++    return 1;
+ }
+ 
+ status_t AudioSystem::startInput(audio_io_handle_t input,
+diff --git a/media/libmedia/AudioTrackShared.cpp b/media/libmedia/AudioTrackShared.cpp
+index 28c2a8a..e234acf 100644
+--- a/media/libmedia/AudioTrackShared.cpp
++++ b/media/libmedia/AudioTrackShared.cpp
+@@ -331,6 +331,21 @@ void ClientProxy::interrupt()
+     }
+ }
+ 
++size_t ClientProxy::getPosition() {
++    ALOGV("getPosition(): position: %d, mEpoch: %d, mCblk->mServer: %d", mEpoch + mCblk->mServer, mEpoch, mCblk->mServer);
++    return mEpoch + mCblk->mServer;
++}
++
++void ClientProxy::setEpoch(size_t epoch) {
++    ALOGV("setEpoch(): %d", epoch);
++    mEpoch = epoch;
++}
++
++size_t ClientProxy::getEpoch() const {
++    ALOGV("getEpoch(): %d", mEpoch);
++    return mEpoch;
++}
++
+ size_t ClientProxy::getMisalignment()
+ {
+     audio_track_cblk_t* cblk = mCblk;
+diff --git a/media/libmedia/IMediaRecorderClient.cpp b/media/libmedia/IMediaRecorderClient.cpp
+index e7907e3..9dfedc0 100644
+--- a/media/libmedia/IMediaRecorderClient.cpp
++++ b/media/libmedia/IMediaRecorderClient.cpp
+@@ -25,6 +25,7 @@ namespace android {
+ 
+ enum {
+     NOTIFY = IBinder::FIRST_CALL_TRANSACTION,
++    READ_AUDIO,
+ };
+ 
+ class BpMediaRecorderClient: public BpInterface<IMediaRecorderClient>
+@@ -44,6 +45,13 @@ public:
+         data.writeInt32(ext2);
+         remote()->transact(NOTIFY, data, &reply, IBinder::FLAG_ONEWAY);
+     }
++
++    virtual void readAudio()
++    {
++        Parcel data, reply;
++        data.writeInterfaceToken(IMediaRecorderClient::getInterfaceDescriptor());
++        remote()->transact(READ_AUDIO, data, &reply, IBinder::FLAG_ONEWAY);
++    }
+ };
+ 
+ IMPLEMENT_META_INTERFACE(MediaRecorderClient, "android.media.IMediaRecorderClient");
+@@ -62,6 +70,11 @@ status_t BnMediaRecorderClient::onTransact(
+             notify(msg, ext1, ext2);
+             return NO_ERROR;
+         } break;
++        case READ_AUDIO: {
++            CHECK_INTERFACE(IMediaRecorderClient, data, reply);
++            readAudio();
++            return NO_ERROR;
++        } break;
+         default:
+             return BBinder::onTransact(code, data, reply, flags);
+     }
+diff --git a/media/libmedia/camera_record_service.cpp b/media/libmedia/camera_record_service.cpp
+new file mode 100644
+index 0000000..56c7f9f
+--- /dev/null
++++ b/media/libmedia/camera_record_service.cpp
+@@ -0,0 +1,293 @@
++/*
++ * Copyright (C) 2014 Canonical Ltd
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Authored by: Jim Hodapp <jim.hodapp@canonical.com>
++ */
++
++#define LOG_NDEBUG 0
++#define LOG_TAG "ICameraRecordService"
++
++#include <media/camera_record_service.h>
++#include <media/record_thread.h>
++#include <media/record_track.h>
++
++#include <binder/IServiceManager.h>
++
++#include <utils/Log.h>
++
++#define REPORT_FUNCTION() ALOGV("%s \n", __PRETTY_FUNCTION__)
++
++namespace android {
++
++// IDecodingServiceSession
++
++BpCameraRecordService::BpCameraRecordService(const sp<IBinder>& impl)
++    : BpInterface<ICameraRecordService>(impl)
++{
++    REPORT_FUNCTION();
++}
++
++BpCameraRecordService::~BpCameraRecordService()
++{
++    REPORT_FUNCTION();
++}
++
++status_t BpCameraRecordService::initRecord(
++        uint32_t sampleRate,
++        audio_format_t format,
++        audio_channel_mask_t channelMask)
++{
++    REPORT_FUNCTION();
++
++    Parcel data, reply;
++    data.writeInterfaceToken(ICameraRecordService::getInterfaceDescriptor());
++    data.writeInt32(sampleRate);
++    data.writeInt32(format);
++    data.writeInt32(channelMask);
++    return remote()->transact(OPEN_RECORD, data, &reply);
++}
++
++sp<IAudioRecord> BpCameraRecordService::openRecord(uint32_t sampleRate,
++                            audio_format_t format,
++                            audio_channel_mask_t channelMask,
++                            size_t frameCount,
++                            pid_t tid,
++                            int *sessionId,
++                            status_t *status)
++{
++    REPORT_FUNCTION();
++
++    Parcel data, reply;
++    sp<IAudioRecord> record;
++    data.writeInterfaceToken(ICameraRecordService::getInterfaceDescriptor());
++    data.writeInt32(sampleRate);
++    data.writeInt32(format);
++    data.writeInt32(channelMask);
++    data.writeInt32(frameCount);
++    data.writeInt32((int32_t) tid);
++    int lSessionId = 0;
++    if (sessionId != 0)
++        lSessionId = *sessionId;
++    data.writeInt32(lSessionId);
++
++    status_t lStatus = remote()->transact(OPEN_RECORD, data, &reply);
++    if (lStatus != NO_ERROR)
++        ALOGE("openRecord error: %s", strerror(-lStatus));
++    else {
++        lStatus = reply.readInt32();
++        record = interface_cast<IAudioRecord>(reply.readStrongBinder());
++        if (lStatus == NO_ERROR) {
++            if (record == 0) {
++                ALOGE("openRecord should have returned an IAudioRecord instance");
++                lStatus = UNKNOWN_ERROR;
++            }
++        } else {
++            if (record != 0) {
++                ALOGE("openRecord returned an IAudioRecord instance but with status %d", lStatus);
++                record.clear();
++            }
++        }
++    }
++    if (status)
++        *status = lStatus;
++
++    return record;
++}
++
++// ----------------------------------------------------------------------------
++
++IMPLEMENT_META_INTERFACE(CameraRecordService, "android.media.ICameraRecordService");
++
++BnCameraRecordService::BnCameraRecordService()
++{
++    REPORT_FUNCTION();
++}
++
++BnCameraRecordService::~BnCameraRecordService()
++{
++    REPORT_FUNCTION();
++}
++
++status_t BnCameraRecordService::onTransact(uint32_t code, const Parcel& data,
++            Parcel* reply, uint32_t flags)
++{
++    REPORT_FUNCTION();
++
++    switch (code) {
++        case INIT_RECORD: {
++            CHECK_INTERFACE(ICameraRecordService, data, reply);
++            uint32_t sampleRate = data.readInt32();
++            audio_format_t format = (audio_format_t) data.readInt32();
++            audio_channel_mask_t channelMask = data.readInt32();
++            reply->writeInt32(initRecord(sampleRate, format, channelMask));
++            return NO_ERROR;
++        } break;
++        case OPEN_RECORD: {
++            CHECK_INTERFACE(ICameraRecordService, data, reply);
++            uint32_t sampleRate = data.readInt32();
++            audio_format_t format = (audio_format_t) data.readInt32();
++            audio_channel_mask_t channelMask = data.readInt32();
++            size_t frameCount = data.readInt32();
++            pid_t tid = (pid_t) data.readInt32();
++            int sessionId = data.readInt32();
++            status_t status;
++            sp<IAudioRecord> record = openRecord(sampleRate, format, channelMask,
++                frameCount, tid, &sessionId, &status);
++            LOG_ALWAYS_FATAL_IF((record != 0) != (status == NO_ERROR));
++
++            reply->writeInt32(sessionId);
++            reply->writeInt32(status);
++            reply->writeStrongBinder(record->asBinder());
++            return NO_ERROR;
++        } break;
++        default:
++            return BBinder::onTransact(code, data, reply, flags);
++    }
++
++    return NO_ERROR;
++}
++
++// ----------------------------------------------------------------------------
++
++sp<CameraRecordService> CameraRecordService::camera_record_service;
++Mutex CameraRecordService::s_lock;
++
++CameraRecordService::CameraRecordService()
++    : mNextUniqueId(1)
++{
++    REPORT_FUNCTION();
++}
++
++CameraRecordService::~CameraRecordService()
++{
++    REPORT_FUNCTION();
++}
++
++void CameraRecordService::instantiate()
++{
++    REPORT_FUNCTION();
++
++    defaultServiceManager()->addService(
++            String16(ICameraRecordService::exported_service_name()), service_instance());
++    ALOGV("Added Binder service '%s' to ServiceManager", ICameraRecordService::exported_service_name());
++}
++
++uint32_t CameraRecordService::nextUniqueId()
++{
++    REPORT_FUNCTION();
++    return android_atomic_inc(&mNextUniqueId);
++}
++
++status_t CameraRecordService::initRecord(
++        uint32_t sampleRate,
++        audio_format_t format,
++        audio_channel_mask_t channelMask)
++{
++    REPORT_FUNCTION();
++
++    Mutex::Autolock _l(mLock);
++    audio_io_handle_t id = nextUniqueId();
++
++    mRecordThread = new RecordThread(sampleRate,
++                              channelMask,
++                              id);
++    if (mRecordThread == NULL) {
++        ALOGE("Failed to instantiate a new RecordThread, audio recording will not function");
++        return UNKNOWN_ERROR;
++    }
++
++    return NO_ERROR;
++}
++
++sp<IAudioRecord> CameraRecordService::openRecord(uint32_t sampleRate,
++                            audio_format_t format,
++                            audio_channel_mask_t channelMask,
++                            size_t frameCount,
++                            pid_t tid,
++                            int *sessionId,
++                            status_t *status)
++{
++    REPORT_FUNCTION();
++
++    status_t lStatus;
++    sp<RecordTrack> recordTrack;
++    sp<RecordHandle> recordHandle;
++    size_t inFrameCount = 0;
++    int lSessionId = 0;
++
++    if (mRecordThread == NULL) {
++        lStatus = UNKNOWN_ERROR;
++        ALOGE("mRecordThread is NULL, call initRecord() first");
++        goto Exit;
++    }
++
++    if (format != AUDIO_FORMAT_PCM_16_BIT) {
++        ALOGE("openRecord() invalid format %d", format);
++        lStatus = BAD_VALUE;
++        goto Exit;
++    }
++
++    { // scope for mLock
++        Mutex::Autolock _l(mLock);
++        // If no audio session id is provided, create one here
++        if (sessionId != NULL && *sessionId != AUDIO_SESSION_OUTPUT_MIX) {
++            lSessionId = *sessionId;
++        } else {
++            lSessionId = nextUniqueId();
++            if (sessionId != NULL) {
++                *sessionId = lSessionId;
++            }
++        }
++        // create new record track.
++        // The record track uses one track in mHardwareMixerThread by convention.
++        // TODO: the uid should be passed in as a parameter to openRecord
++        recordTrack = mRecordThread->createRecordTrack_l(sampleRate, format, channelMask,
++                                                  frameCount, lSessionId,
++                                                  IPCThreadState::self()->getCallingUid(),
++                                                  tid, &lStatus);
++        LOG_ALWAYS_FATAL_IF((recordTrack != 0) != (lStatus == NO_ERROR));
++    }
++
++    if (lStatus != NO_ERROR) {
++        recordTrack.clear();
++        goto Exit;
++    }
++
++    // return to handle to client
++    recordHandle = new RecordHandle(recordTrack);
++    lStatus = NO_ERROR;
++
++Exit:
++    if (status) {
++        *status = lStatus;
++    }
++    return recordHandle;
++}
++
++sp<CameraRecordService>& CameraRecordService::service_instance()
++{
++    REPORT_FUNCTION();
++
++    Mutex::Autolock _l(s_lock);
++    if (camera_record_service == NULL)
++    {
++        ALOGD("Creating new static instance of CameraRecordService");
++        camera_record_service = new CameraRecordService();
++    }
++
++    return camera_record_service;
++}
++
++} // namespace android
+diff --git a/media/libmedia/record_thread.cpp b/media/libmedia/record_thread.cpp
+new file mode 100644
+index 0000000..e59cbf2
+--- /dev/null
++++ b/media/libmedia/record_thread.cpp
+@@ -0,0 +1,567 @@
++/*
++ * Copyright (C) 2014 Canonical Ltd
++ * Copyright 2012, The Android Open Source Project
++ * NOTE: Reimplemented starting from Android RecordThread class
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Authored by: Jim Hodapp <jim.hodapp@canonical.com>
++ */
++
++#define LOG_NDEBUG 0
++#define LOG_TAG "RecordThread"
++
++#include <media/record_thread.h>
++#include <media/record_track.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++
++#include <hybris/media/media_recorder_layer.h>
++#include <hardware_legacy/power.h>
++#include <audio_utils/primitives.h>
++
++#include <utils/Log.h>
++
++#define REPORT_FUNCTION() ALOGV("%s \n", __PRETTY_FUNCTION__)
++
++namespace android {
++
++// don't warn about blocked writes or record buffer overflows more often than this
++static const nsecs_t kWarningThrottleNs = seconds(5);
++
++// RecordThread loop sleep time upon application overrun or audio HAL read error
++static const int kRecordThreadSleepUs = 5000;
++
++ThreadBase::ThreadBase(audio_io_handle_t id)
++    : Thread(false),
++      mStandby(false),
++      mId(id)
++{
++}
++
++ThreadBase::~ThreadBase()
++{
++}
++
++void ThreadBase::exit()
++{
++}
++
++void ThreadBase::acquireWakeLock()
++{
++    ALOGE("acquiring wakelock for '%s'", mName);
++    int ret = acquire_wake_lock(PARTIAL_WAKE_LOCK, mName);
++    ALOGW("acquire_wake_lock: %d", ret);
++    if (ret < 0)
++        ALOGW("Failed to acquire wake lock for recording: %s", strerror(errno));
++}
++
++void ThreadBase::releaseWakeLock()
++{
++    ALOGE("releasing wakelock for '%s'", mName);
++    int ret = release_wake_lock(mName);
++    ALOGW("release_wake_lock: %d", ret);
++    if (ret < 0)
++        ALOGW("Failed to release wake lock for recording: %s", strerror(errno));
++}
++
++//---------- RecordThread -----------//
++
++RecordThread::RecordThread(uint32_t sampleRate, audio_channel_mask_t channelMask, audio_io_handle_t id)
++    : ThreadBase(id),
++      m_fifoFd(-1),
++      mRsmpOutBuffer(NULL),
++      mRsmpInBuffer(NULL),
++      mReqChannelCount(popcount(channelMask)),
++      mReqSampleRate(sampleRate),
++      mFramestoDrop(0)
++{
++    REPORT_FUNCTION();
++
++    snprintf(mName, kNameLength, "AudioIn_%X", id);
++    readInputParameters();
++
++}
++
++RecordThread::~RecordThread()
++{
++    REPORT_FUNCTION();
++
++    close(m_fifoFd);
++}
++
++void RecordThread::destroyTrack_l(const sp<RecordTrack>& track)
++{
++    REPORT_FUNCTION();
++
++    track->terminate();
++    track->mState = RecordTrack::STOPPED;
++    // active tracks are removed by threadLoop()
++    if (mActiveTrack != track) {
++        removeTrack_l(track);
++    }
++}
++
++void RecordThread::removeTrack_l(const sp<RecordTrack>& track)
++{
++    REPORT_FUNCTION();
++
++    mTracks.remove(track);
++}
++
++bool RecordThread::threadLoop()
++{
++    REPORT_FUNCTION();
++
++    AudioBufferProvider::Buffer buffer;
++    sp<RecordTrack> activeTrack;
++    nsecs_t lastWarning = 0;
++
++    {
++        Mutex::Autolock _l(mLock);
++        activeTrack = mActiveTrack;
++        acquireWakeLock();
++    }
++
++    // used to verify we've read at least once before evaluating how many bytes were read
++    bool readOnce = false;
++
++    // start recording
++    while (!exitPending()) {
++
++        //processConfigEvents();
++
++        { // scope for mLock
++            Mutex::Autolock _l(mLock);
++            //checkForNewParameters_l();
++            if (mActiveTrack != 0 && activeTrack != mActiveTrack) {
++                SortedVector<int> tmp;
++                tmp.add(mActiveTrack->uid());
++            }
++            activeTrack = mActiveTrack;
++            if (mActiveTrack == 0) {
++                if (exitPending()) {
++                    break;
++                }
++
++                releaseWakeLock();
++                ALOGV("RecordThread: loop stopping");
++                // go to sleep
++                mWaitWorkCV.wait(mLock);
++                ALOGV("RecordThread: loop starting");
++                acquireWakeLock();
++                continue;
++            }
++
++            if (mActiveTrack != 0) {
++                if (mActiveTrack->isTerminated()) {
++                    removeTrack_l(mActiveTrack);
++                    mActiveTrack.clear();
++                } else if (mActiveTrack->mState == RecordTrack::PAUSING) {
++                    mActiveTrack.clear();
++                    mStartStopCond.broadcast();
++                } else if (mActiveTrack->mState == RecordTrack::RESUMING) {
++                    if (mReqChannelCount != mActiveTrack->channelCount()) {
++                        mActiveTrack.clear();
++                        mStartStopCond.broadcast();
++                    } else if (readOnce) {
++                        // record start succeeds only if first read from audio input
++                        // succeeds
++                        if (mBytesRead >= 0) {
++                            mActiveTrack->mState = RecordTrack::ACTIVE;
++                        } else {
++                            mActiveTrack.clear();
++                        }
++                        mStartStopCond.broadcast();
++                    }
++                    mStandby = false;
++                }
++            }
++        }
++
++        if (mActiveTrack != 0) {
++            if (mActiveTrack->mState != RecordTrack::ACTIVE &&
++                mActiveTrack->mState != RecordTrack::RESUMING) {
++                usleep(kRecordThreadSleepUs);
++                continue;
++            }
++
++            buffer.frameCount = mFrameCount;
++            status_t status = mActiveTrack->getNextBuffer(&buffer);
++            if (status == NO_ERROR) {
++                readOnce = true;
++                size_t framesOut = buffer.frameCount;
++                while (framesOut) {
++                    size_t framesIn = mFrameCount - mRsmpInIndex;
++                    if (framesIn) {
++                        int8_t *src = (int8_t *)mRsmpInBuffer + mRsmpInIndex * mFrameSize;
++                        int8_t *dst = buffer.i8 + (buffer.frameCount - framesOut) *
++                            mActiveTrack->mFrameSize;
++                        if (framesIn > framesOut)
++                            framesIn = framesOut;
++                        mRsmpInIndex += framesIn;
++                        framesOut -= framesIn;
++                        if (mChannelCount == mReqChannelCount) {
++                            memcpy(dst, src, framesIn * mFrameSize);
++                        } else {
++                            if (mChannelCount == 1) {
++                                upmix_to_stereo_i16_from_mono_i16((int16_t *)dst,
++                                        (int16_t *)src, framesIn);
++                            } else {
++                                downmix_to_mono_i16_from_stereo_i16((int16_t *)dst,
++                                        (int16_t *)src, framesIn);
++                            }
++                        }
++                    }
++                    if (framesOut && mFrameCount == mRsmpInIndex) {
++                        void *readInto;
++                        if (framesOut == mFrameCount && mChannelCount == mReqChannelCount) {
++                            readInto = buffer.raw;
++                            framesOut = 0;
++                        } else {
++                            readInto = mRsmpInBuffer;
++                            mRsmpInIndex = 0;
++                        }
++                        // Read from the named pipe /dev/socket/micshm
++                        mBytesRead = readPipe(readInto, mBufferSize);
++                        if (mBytesRead <= 0) {
++                            if ((mBytesRead < 0) && (mActiveTrack->mState == RecordTrack::ACTIVE))
++                            {
++                                ALOGE("Error reading audio input");
++                                // Force input into standby so that it tries to
++                                // recover at next read attempt
++                                usleep(kRecordThreadSleepUs);
++                            }
++                            mRsmpInIndex = mFrameCount;
++                            framesOut = 0;
++                            buffer.frameCount = 0;
++                        }
++                    }
++                }
++                if (mFramestoDrop == 0) {
++                    mActiveTrack->releaseBuffer(&buffer);
++                } else {
++                    if (mFramestoDrop > 0) {
++                        mFramestoDrop -= buffer.frameCount;
++                        if (mFramestoDrop <= 0) {
++                            clearSyncStartEvent();
++                        }
++                    } else {
++                        mFramestoDrop += buffer.frameCount;
++                        if (mFramestoDrop >= 0 || mSyncStartEvent == 0 ||
++                                mSyncStartEvent->isCancelled()) {
++                            ALOGW("Synced record %s, session %d, trigger session %d",
++                                  (mFramestoDrop >= 0) ? "timed out" : "cancelled",
++                                  mActiveTrack->sessionId(),
++                                  (mSyncStartEvent != 0) ? mSyncStartEvent->triggerSession() : 0);
++                            clearSyncStartEvent();
++                        }
++                    }
++                }
++            }
++            // client isn't retrieving buffers fast enough
++            else {
++                ALOGW("Client isn't retrieving buffers fast enough!");
++                if (!mActiveTrack->setOverflow()) {
++                    nsecs_t now = systemTime();
++                    if ((now - lastWarning) > kWarningThrottleNs) {
++                        ALOGW("RecordThread: buffer overflow");
++                        lastWarning = now;
++                    }
++                }
++                // Release the processor for a while before asking for a new buffer.
++                // This will give the application more chance to read from the buffer and
++                // clear the overflow.
++                usleep(kRecordThreadSleepUs);
++            }
++        }
++    }
++
++    {
++        Mutex::Autolock _l(mLock);
++        for (size_t i = 0; i < mTracks.size(); i++) {
++            sp<RecordTrack> track = mTracks[i];
++            track->invalidate();
++        }
++        mActiveTrack.clear();
++        mStartStopCond.broadcast();
++    }
++
++    releaseWakeLock();
++
++    ALOGV("RecordThread %p exiting", this);
++    return false;
++}
++
++status_t RecordThread::readyToRun()
++{
++    REPORT_FUNCTION();
++
++    return NO_ERROR;
++}
++
++void RecordThread::onFirstRef()
++{
++    REPORT_FUNCTION();
++
++    run(mName, PRIORITY_URGENT_AUDIO);
++}
++
++sp<RecordTrack> RecordThread::createRecordTrack_l(
++        uint32_t sampleRate,
++        audio_format_t format,
++        audio_channel_mask_t channelMask,
++        size_t frameCount,
++        int sessionId,
++        int uid,
++        pid_t tid,
++        status_t *status)
++{
++    REPORT_FUNCTION();
++
++    sp<RecordTrack> track;
++    status_t lStatus;
++
++    { // scope for mLock
++        Mutex::Autolock _l(mLock);
++
++        track = new RecordTrack(this, sampleRate,
++                      format, channelMask, frameCount, 0 /* sharedBuffer */, sessionId, uid);
++
++        if (track->getCblk() == 0) {
++            ALOGE("createRecordTrack_l() no control block");
++            lStatus = NO_MEMORY;
++            track.clear();
++            goto Exit;
++        }
++        mTracks.add(track);
++
++    }
++    lStatus = NO_ERROR;
++
++Exit:
++    if (status) {
++        *status = lStatus;
++    }
++    return track;
++}
++
++status_t RecordThread::start(RecordTrack* recordTrack,
++        AudioSystem::sync_event_t event,
++        int triggerSession)
++{
++    ALOGV("RecordThread::start event %d, triggerSession %d", event, triggerSession);
++    sp<ThreadBase> strongMe = this;
++    status_t status = NO_ERROR;
++
++    {
++        AutoMutex lock(mLock);
++        if (mActiveTrack != 0) {
++            if (recordTrack != mActiveTrack.get()) {
++                status = -EBUSY;
++            } else if (mActiveTrack->mState == RecordTrack::PAUSING) {
++                mActiveTrack->mState = RecordTrack::ACTIVE;
++            }
++            return status;
++        }
++
++        recordTrack->mState = RecordTrack::IDLE;
++        mActiveTrack = recordTrack;
++
++        if (status != NO_ERROR) {
++            mActiveTrack.clear();
++            clearSyncStartEvent();
++            return status;
++        }
++        mRsmpInIndex = mFrameCount;
++        mBytesRead = 0;
++
++        mActiveTrack->mState = RecordTrack::RESUMING;
++        // signal thread to start
++        ALOGV("Signal record thread");
++        mWaitWorkCV.broadcast();
++        // do not wait for mStartStopCond if exiting
++        if (exitPending()) {
++            mActiveTrack.clear();
++            status = INVALID_OPERATION;
++            goto startError;
++        }
++        mStartStopCond.wait(mLock);
++        if (mActiveTrack == 0) {
++            ALOGV("Record failed to start");
++            status = BAD_VALUE;
++            goto startError;
++        }
++        ALOGV("Record started OK");
++        return status;
++    }
++
++startError:
++    clearSyncStartEvent();
++    close(m_fifoFd);
++    return status;
++}
++
++void RecordThread::clearSyncStartEvent()
++{
++    if (mSyncStartEvent != 0) {
++        mSyncStartEvent->cancel();
++    }
++    mSyncStartEvent.clear();
++    mFramestoDrop = 0;
++}
++
++bool RecordThread::stop(RecordTrack* recordTrack)
++{
++    REPORT_FUNCTION();
++
++    AutoMutex _l(mLock);
++    if (recordTrack != mActiveTrack.get() || recordTrack->mState == RecordTrack::PAUSING) {
++        return false;
++    }
++    recordTrack->mState = RecordTrack::PAUSING;
++    // do not wait for mStartStopCond if exiting
++    if (exitPending()) {
++        return true;
++    }
++    mStartStopCond.wait(mLock);
++    // if we have been restarted, recordTrack == mActiveTrack.get() here
++    if (exitPending() || recordTrack != mActiveTrack.get()) {
++        ALOGV("Record stopped OK");
++        return true;
++    }
++    return false;
++}
++
++status_t RecordThread::getNextBuffer(AudioBufferProvider::Buffer* buffer, int64_t pts)
++{
++    REPORT_FUNCTION();
++
++    size_t framesReq = buffer->frameCount;
++    size_t framesReady = mFrameCount - mRsmpInIndex;
++    int channelCount;
++
++    if (framesReady == 0) {
++        // Read from the named pipe /dev/socket/micshm
++        mBytesRead = readPipe(mRsmpInBuffer, mBufferSize);
++        if (mBytesRead <= 0) {
++            if ((mBytesRead < 0) && (mActiveTrack->mState == RecordTrack::ACTIVE)) {
++                ALOGE("RecordThread::getNextBuffer() Error reading audio input");
++                // Force input into standby so that it tries to
++                // recover at next read attempt
++                usleep(kRecordThreadSleepUs);
++            }
++            buffer->raw = NULL;
++            buffer->frameCount = 0;
++            return NOT_ENOUGH_DATA;
++        }
++        mRsmpInIndex = 0;
++        framesReady = mFrameCount;
++    }
++
++    if (framesReq > framesReady) {
++        framesReq = framesReady;
++    }
++
++    if (mChannelCount == 1 && mReqChannelCount == 2) {
++        channelCount = 1;
++    } else {
++        channelCount = 2;
++    }
++    buffer->raw = mRsmpInBuffer + mRsmpInIndex * channelCount;
++    buffer->frameCount = framesReq;
++    return NO_ERROR;
++}
++
++void RecordThread::releaseBuffer(AudioBufferProvider::Buffer* buffer)
++{
++    REPORT_FUNCTION();
++
++    mRsmpInIndex += buffer->frameCount;
++    buffer->frameCount = 0;
++}
++
++void RecordThread::readInputParameters()
++{
++    REPORT_FUNCTION();
++
++    // TODO: these are all hardcoded for right now, they should be
++    // obtained through more dynamic means
++    mSampleRate = 48000;
++    mChannelMask = 0x10;   // FIXME: where should this come from?
++    mChannelCount = popcount(mChannelMask);
++    mFormat = AUDIO_FORMAT_PCM_16_BIT;
++    mFrameSize = 2;
++    mBufferSize = MIC_READ_BUF_SIZE * sizeof(int16_t);
++    mFrameCount = mBufferSize / mFrameSize;
++    mRsmpInBuffer = new int16_t[mBufferSize];
++    mRsmpInIndex = mFrameCount;
++
++    ALOGV("mSampleRate: %d", mSampleRate);
++    ALOGV("mChannelMask: %d", mChannelMask);
++    ALOGV("mChannelCount: %d", mChannelCount);
++    ALOGV("mFormat: %d", mFormat);
++    ALOGV("mFrameSize: %d", mFrameSize);
++    ALOGV("mBufferSize: %d", mBufferSize);
++    ALOGV("mFrameCount: %d", mFrameCount);
++    ALOGV("mRsmpInIndex: %d", mRsmpInIndex);
++}
++
++bool RecordThread::openPipe()
++{
++    if (m_fifoFd > 0) {
++        ALOGW("/dev/socket/micshm already opened, not opening twice");
++        return true;
++    }
++
++    // Open read access to the named pipe that lives on the application side
++    m_fifoFd = open("/dev/socket/micshm", O_RDONLY); //| O_NONBLOCK);
++    if (m_fifoFd < 0) {
++        ALOGE("Failed to open named pipe /dev/socket/micshm %s", strerror(errno));
++        return false;
++    }
++
++    return true;
++}
++
++ssize_t RecordThread::readPipe(void *buffer, size_t size)
++{
++    REPORT_FUNCTION();
++
++    if (buffer == NULL || size == 0)
++    {
++        ALOGE("Can't read named pipe, buffer is NULL or size is 0");
++        return 0;
++    }
++
++    if (m_fifoFd < 0) {
++        openPipe();
++    }
++
++    ssize_t readSize = read(m_fifoFd, buffer, size);
++    if (readSize < 0)
++    {
++        ALOGE("Failed to read in data from named pipe /dev/socket/micshm: %s", strerror(errno));
++        readSize = 0;
++    }
++    else
++        ALOGV("Read in %d bytes into buffer", readSize);
++
++    return readSize;
++}
++
++} // namespace android
+diff --git a/media/libmedia/record_track.cpp b/media/libmedia/record_track.cpp
+new file mode 100644
+index 0000000..e1c68b7
+--- /dev/null
++++ b/media/libmedia/record_track.cpp
+@@ -0,0 +1,272 @@
++/*
++ * Copyright (C) 2014 Canonical Ltd
++ * Copyright 2012, The Android Open Source Project
++ * NOTE: Reimplemented starting from Android RecordThread class
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ * Authored by: Jim Hodapp <jim.hodapp@canonical.com>
++ */
++
++#define LOG_NDEBUG 0
++#define LOG_TAG "RecordTrack"
++
++#include <media/record_track.h>
++#include <media/record_thread.h>
++
++#include <utils/Atomic.h>
++#include <binder/IPCThreadState.h>
++#include <binder/MemoryDealer.h>
++#include <utils/Log.h>
++
++#define REPORT_FUNCTION() ALOGV("%s \n", __PRETTY_FUNCTION__)
++
++namespace android {
++
++static volatile int32_t nextTrackId = 55;
++
++RecordTrack::RecordTrack(ThreadBase *thread,
++            uint32_t sampleRate,
++            audio_format_t format,
++            audio_channel_mask_t channelMask,
++            size_t frameCount,
++            const sp<IMemory>& sharedBuffer,
++            int sessionId,
++            int clientUid)
++    : RefBase(),
++      mThread(thread),
++      mMemoryDealer(new MemoryDealer(1024*1024, "AudioFlinger::Client")),
++      mCblk(NULL),
++      // mBuffer
++      mState(IDLE),
++      mSampleRate(sampleRate),
++      mFormat(format),
++      mChannelMask(channelMask),
++      mChannelCount(popcount(channelMask)),
++      mFrameSize(audio_is_linear_pcm(format) ?
++                mChannelCount * audio_bytes_per_sample(format) : sizeof(int8_t)),
++      mSessionId(sessionId),
++      mOverflow(false),
++      mId(android_atomic_inc(&nextTrackId)),
++      mTerminated(false)
++{
++    REPORT_FUNCTION();
++
++    // This was originally in AudioFlinger's ctor
++    getpid_cached = getpid();
++
++    // if the caller is us, trust the specified uid
++    if (IPCThreadState::self()->getCallingPid() != getpid_cached || clientUid == -1) {
++        int newclientUid = IPCThreadState::self()->getCallingUid();
++        if (clientUid != -1 && clientUid != newclientUid) {
++            ALOGW("uid %d tried to pass itself off as %d", newclientUid, clientUid);
++        }
++        clientUid = newclientUid;
++    }
++    // clientUid contains the uid of the app that is responsible for this track, so we can blame
++    // battery usage on it.
++    mUid = clientUid;
++
++    ALOGV_IF(sharedBuffer != 0, "sharedBuffer: %p, size: %d", sharedBuffer->pointer(),
++            sharedBuffer->size());
++
++    size_t size = sizeof(audio_track_cblk_t);
++    size_t bufferSize = (sharedBuffer == 0 ? roundup(frameCount) : frameCount) * mFrameSize;
++    if (sharedBuffer == 0) {
++        size += bufferSize;
++    }
++    ALOGD("Creating track with buffers @ %d bytes", bufferSize);
++
++    if (mMemoryDealer != 0) {
++        mCblkMemory = mMemoryDealer->allocate(size);
++        if (mCblkMemory != 0) {
++            mCblk = static_cast<audio_track_cblk_t *>(mCblkMemory->pointer());
++            // can't assume mCblk != NULL
++        } else {
++            ALOGE("not enough memory for AudioTrack size=%u", size);
++            mMemoryDealer->dump("AudioTrack");
++            return;
++        }
++    } else {
++        // this syntax avoids calling the audio_track_cblk_t constructor twice
++        mCblk = (audio_track_cblk_t *) new uint8_t[size];
++        // assume mCblk != NULL
++    }
++
++    // construct the shared structure in-place.
++    if (mCblk != NULL) {
++        new(mCblk) audio_track_cblk_t();
++        // clear all buffers
++        if (sharedBuffer == 0) {
++            mBuffer = (char*)mCblk + sizeof(audio_track_cblk_t);
++            memset(mBuffer, 0, bufferSize);
++        } else {
++            mBuffer = sharedBuffer->pointer();
++#if 0
++            mCblk->mFlags = CBLK_FORCEREADY;    // FIXME hack, need to fix the track ready logic
++#endif
++        }
++    }
++
++    if (mCblk != NULL) {
++        // TO-DO: check
++        mAudioRecordServerProxy = new AudioRecordServerProxy(mCblk, mBuffer, frameCount, mFrameSize, false);
++        mServerProxy = mAudioRecordServerProxy;
++    }
++}
++
++RecordTrack::~RecordTrack()
++{
++    REPORT_FUNCTION();
++}
++
++status_t RecordTrack::start(AudioSystem::sync_event_t event, int triggerSession)
++{
++    REPORT_FUNCTION();
++
++    sp<ThreadBase> thread = mThread.promote();
++    if (thread != 0) {
++        RecordThread *recordThread = (RecordThread *)thread.get();
++        return recordThread->start(this, event, triggerSession);
++    } else {
++        return BAD_VALUE;
++    }
++}
++
++void RecordTrack::stop()
++{
++    REPORT_FUNCTION();
++
++    sp<ThreadBase> thread = mThread.promote();
++    if (thread != 0) {
++        RecordThread *recordThread = (RecordThread *)thread.get();
++        if (recordThread->stop(this)) {
++            ALOGV("AudioFlinger used to stop the input here, not stopping with Pulseaudio");
++        }
++    }
++}
++
++status_t RecordTrack::getNextBuffer(AudioBufferProvider::Buffer* buffer, int64_t pts)
++{
++    REPORT_FUNCTION();
++
++    ServerProxy::Buffer buf;
++    buf.mFrameCount = buffer->frameCount;
++    status_t status = mServerProxy->obtainBuffer(&buf);
++    buffer->frameCount = buf.mFrameCount;
++    buffer->raw = buf.mRaw;
++    if (buf.mFrameCount == 0) {
++        // FIXME also wake futex so that overrun is noticed more quickly
++        (void) android_atomic_or(CBLK_OVERRUN, &mCblk->mFlags);
++    }
++    return status;
++}
++
++void RecordTrack::releaseBuffer(AudioBufferProvider::Buffer* buffer)
++{
++    REPORT_FUNCTION();
++
++    ServerProxy::Buffer buf;
++    buf.mFrameCount = buffer->frameCount;
++    buf.mRaw = buffer->raw;
++    buffer->frameCount = 0;
++    buffer->raw = NULL;
++    mServerProxy->releaseBuffer(&buf);
++}
++
++void RecordTrack::destroy()
++{
++    REPORT_FUNCTION();
++
++    // see comments at AudioFlinger::PlaybackThread::Track::destroy()
++    sp<RecordTrack> keep(this);
++    {
++        sp<ThreadBase> thread = mThread.promote();
++        if (thread != 0) {
++            if (mState == ACTIVE || mState == RESUMING) {
++                ALOGV("AudioFlinger used to stop the input here, not stopping with Pulseaudio");
++            }
++            Mutex::Autolock _l(thread->mLock);
++            RecordThread *recordThread = (RecordThread *) thread.get();
++            recordThread->destroyTrack_l(this);
++        }
++    }
++}
++
++void RecordTrack::invalidate()
++{
++    REPORT_FUNCTION();
++#if 0
++    // FIXME should use proxy, and needs work
++    audio_track_cblk_t* cblk = mCblk;
++    android_atomic_or(CBLK_INVALID, &cblk->mFlags);
++    android_atomic_release_store(0x40000000, &cblk->mFutex);
++    // client is not in server, so FUTEX_WAKE is needed instead of FUTEX_WAKE_PRIVATE
++    (void) __futex_syscall3(&cblk->mFutex, FUTEX_WAKE, INT_MAX);
++#endif
++}
++
++RecordHandle::RecordHandle(
++        const sp<RecordTrack>& recordTrack)
++    : BnAudioRecord(),
++    mRecordTrack(recordTrack)
++{
++    REPORT_FUNCTION();
++}
++
++RecordHandle::~RecordHandle()
++{
++    REPORT_FUNCTION();
++
++    stop_nonvirtual();
++    mRecordTrack->destroy();
++}
++
++sp<IMemory> RecordHandle::getCblk() const
++{
++    REPORT_FUNCTION();
++
++    return mRecordTrack->getCblk();
++}
++
++status_t RecordHandle::start(int /*AudioSystem::sync_event_t*/ event,
++        int triggerSession)
++        {
++    REPORT_FUNCTION();
++
++    return mRecordTrack->start((AudioSystem::sync_event_t)event, triggerSession);
++}
++
++void RecordHandle::stop()
++{
++    REPORT_FUNCTION();
++
++    stop_nonvirtual();
++}
++
++void RecordHandle::stop_nonvirtual()
++{
++    REPORT_FUNCTION();
++
++    mRecordTrack->stop();
++}
++
++status_t RecordHandle::onTransact(
++    uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags)
++{
++    REPORT_FUNCTION();
++
++    return BnAudioRecord::onTransact(code, data, reply, flags);
++}
++
++} // namespace android
+diff --git a/media/libmediaplayerservice/StagefrightRecorder.cpp b/media/libmediaplayerservice/StagefrightRecorder.cpp
+index 90d4a25..29ccfe6 100644
+--- a/media/libmediaplayerservice/StagefrightRecorder.cpp
++++ b/media/libmediaplayerservice/StagefrightRecorder.cpp
+@@ -126,6 +126,21 @@ sp<IGraphicBufferProducer> StagefrightRecorder::querySurfaceMediaSource() const
+     return mGraphicBufferProducer;
+ }
+ 
++void StagefrightRecorder::onReadAudioCb(void *context)
++{
++    ALOGV("onReadAudioCb");
++    if (context != NULL) {
++        StagefrightRecorder *sr = static_cast<StagefrightRecorder*>(context);
++        sr->onReadAudio();
++    }
++}
++
++void StagefrightRecorder::onReadAudio()
++{
++    ALOGV("onReadAudio");
++    mListener->readAudio();
++}
++
+ status_t StagefrightRecorder::setAudioSource(audio_source_t as) {
+     ALOGV("setAudioSource: %d", as);
+     if (as < AUDIO_SOURCE_DEFAULT ||
+@@ -794,6 +809,7 @@ status_t StagefrightRecorder::setParameters(const String8 &params) {
+ }
+ 
+ status_t StagefrightRecorder::setListener(const sp<IMediaRecorderClient> &listener) {
++    ALOGD("setListener");
+     mListener = listener;
+ 
+     return OK;
+@@ -1027,6 +1043,14 @@ sp<MediaSource> StagefrightRecorder::createAudioSource() {
+         return NULL;
+     }
+ 
++    if (audioSource != 0) {
++        audioSource->setListener(mListener);
++        audioSource->setReadAudioCb(&StagefrightRecorder::onReadAudioCb, this);
++    }
++    else {
++        ALOGW("Can't call AudioSource::setListener since audioSource is NULL");
++    }
++
+     sp<AMessage> format = new AMessage;
+     const char *mime;
+     switch (mAudioEncoder) {
+@@ -1881,6 +1905,7 @@ void StagefrightRecorder::setupMPEG4orWEBMMetaData(sp<MetaData> *meta) {
+             (*meta)->setInt64(kKeyTrackTimeStatus, mTrackEveryTimeDurationUs);
+         }
+         if (mRotationDegrees != 0) {
++            ALOGV("Setting rotation degrees to be %d", mRotationDegrees);
+             (*meta)->setInt32(kKeyRotation, mRotationDegrees);
+         }
+     }
+diff --git a/media/libmediaplayerservice/StagefrightRecorder.h b/media/libmediaplayerservice/StagefrightRecorder.h
+index 527b645..fbbceab 100644
+--- a/media/libmediaplayerservice/StagefrightRecorder.h
++++ b/media/libmediaplayerservice/StagefrightRecorder.h
+@@ -79,6 +79,7 @@ struct StagefrightRecorder : public MediaRecorderBase {
+     virtual status_t dump(int fd, const Vector<String16>& args) const;
+     // Querying a SurfaceMediaSourcer
+     virtual sp<IGraphicBufferProducer> querySurfaceMediaSource() const;
++    static void onReadAudioCb(void *context);
+ 
+ private:
+     AppOpsManager mAppOpsManager;
+@@ -142,6 +143,7 @@ private:
+     // frame buffers will be queued and dequeued
+     sp<IGraphicBufferProducer> mGraphicBufferProducer;
+     sp<ALooper> mLooper;
++    void onReadAudio();
+ 
+     sp<RecorderExtendedStats> mRecorderExtendedStats;
+ 
+diff --git a/media/libstagefright/AudioSource.cpp b/media/libstagefright/AudioSource.cpp
+index f82a58e..8319897 100644
+--- a/media/libstagefright/AudioSource.cpp
++++ b/media/libstagefright/AudioSource.cpp
+@@ -31,6 +31,8 @@
+ #include <cutils/properties.h>
+ #include <system/audio.h>
+ 
++#include <media/IMediaRecorderClient.h>
++
+ #define AUDIO_RECORD_DEFAULT_BUFFER_DURATION 20
+ namespace android {
+ 
+@@ -41,7 +43,9 @@ static void AudioRecordCallbackFunction(int event, void *user, void *info) {
+ 
+ AudioSource::AudioSource(
+         audio_source_t inputSource, uint32_t sampleRate, uint32_t channelCount)
+-    : mStarted(false),
++    : mAudioReadCb(0),
++      mAudioReadContext(0),
++      mStarted(false),
+       mSampleRate(sampleRate),
+       mTrackMaxAmplitude(false),
+       mStartTimeUs(0),
+@@ -224,6 +228,14 @@ status_t AudioSource::initCheck() const {
+     return mInitCheck;
+ }
+ 
++status_t AudioSource::setListener(const sp<IMediaRecorderClient>& listener)
++{
++    Mutex::Autolock autoLock(mLock);
++    mListener = listener;
++
++    return NO_ERROR;
++}
++
+ status_t AudioSource::start(MetaData *params) {
+     Mutex::Autolock autoLock(mLock);
+     if (mRecPaused) {
+@@ -267,7 +279,6 @@ status_t AudioSource::pause() {
+ }
+ 
+ void AudioSource::releaseQueuedFrames_l() {
+-    ALOGV("releaseQueuedFrames_l");
+     List<MediaBuffer *>::iterator it;
+     while (!mBuffersReceived.empty()) {
+         it = mBuffersReceived.begin();
+@@ -311,6 +322,25 @@ status_t AudioSource::reset() {
+     return OK;
+ }
+ 
++void AudioSource::setReadAudioCb(on_audio_source_read_audio cb, void *context)
++{
++    mAudioReadCb = cb;
++    mAudioReadContext = context;
++
++    // RecordThread has been setup successfully by this point, so signal
++    // the callback to trigger the writer to begin read/writing mic data
++    triggerReadAudio();
++}
++
++void AudioSource::triggerReadAudio()
++{
++    if (mAudioReadCb != NULL) {
++        mAudioReadCb(mAudioReadContext);
++    }
++    else
++        ALOGW("Couldn't read new audio data since mAudioReadCb is NULL");
++}
++
+ sp<MetaData> AudioSource::getFormat() {
+     Mutex::Autolock autoLock(mLock);
+     if (mInitCheck != OK) {
+@@ -410,7 +440,6 @@ status_t AudioSource::read(
+ }
+ 
+ void AudioSource::signalBufferReturned(MediaBuffer *buffer) {
+-    ALOGV("signalBufferReturned: %p", buffer->data());
+     Mutex::Autolock autoLock(mLock);
+     --mNumClientOwnedBuffers;
+     buffer->setObserver(0);
+diff --git a/media/libstagefright/MPEG4Writer.cpp b/media/libstagefright/MPEG4Writer.cpp
+index b94e334..51a9114 100644
+--- a/media/libstagefright/MPEG4Writer.cpp
++++ b/media/libstagefright/MPEG4Writer.cpp
+@@ -14,7 +14,7 @@
+  * limitations under the License.
+  */
+ 
+-//#define LOG_NDEBUG 0
++#define LOG_NDEBUG 0
+ #define LOG_TAG "MPEG4Writer"
+ 
+ #include <arpa/inet.h>
+@@ -1774,7 +1774,9 @@ status_t MPEG4Writer::Track::start(MetaData *params) {
+     mStartTimeRealUs = startTimeUs;
+ 
+     int32_t rotationDegrees;
++    ALOGV("Seeing if we can set rotationDegrees");
+     if (!mIsAudio && params && params->findInt32(kKeyRotation, &rotationDegrees)) {
++        ALOGV("Setting rotationDegrees to be: %d", rotationDegrees);
+         mRotation = rotationDegrees;
+     }
+ 
+@@ -2975,6 +2977,7 @@ void MPEG4Writer::Track::writeTkhdBox(uint32_t now) {
+     mOwner->writeInt16(mIsAudio ? 0x100 : 0);  // volume
+     mOwner->writeInt16(0);             // reserved
+ 
++    ALOGV("Setting mRotation to be (matrix): %d", mRotation);
+     mOwner->writeCompositionMatrix(mRotation);       // matrix
+ 
+     if (mIsAudio) {
+-- 
+2.7.4
+

@@ -1,0 +1,35 @@
+From df8df34a953fae3b362d3e5d98453375d44ddb86 Mon Sep 17 00:00:00 2001
+From: Ricardo Salveti de Araujo <ricardo.salveti@canonical.com>
+Date: Mon, 26 Nov 2012 15:02:39 -0200
+Subject: [PATCH 1/2] binder: don't use android's check permission feature
+
+Change-Id: I70946811c0af9899c46b4217f662bb41503b36e8
+Signed-off-by: Ricardo Salveti de Araujo <ricardo.salveti@canonical.com>
+Signed-off-by: Ondrej Kubik <ondrej.kubik@canonical.com>
+---
+ libs/binder/IServiceManager.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/libs/binder/IServiceManager.cpp b/libs/binder/IServiceManager.cpp
+index 7b1b0e7..3e33cf6 100644
+--- a/libs/binder/IServiceManager.cpp
++++ b/libs/binder/IServiceManager.cpp
+@@ -57,6 +57,7 @@ static String16 _permission("permission");
+ 
+ bool checkCallingPermission(const String16& permission, int32_t* outPid, int32_t* outUid)
+ {
++    return true;
+     IPCThreadState* ipcState = IPCThreadState::self();
+     pid_t pid = ipcState->getCallingPid();
+     uid_t uid = ipcState->getCallingUid();
+@@ -67,6 +68,7 @@ bool checkCallingPermission(const String16& permission, int32_t* outPid, int32_t
+ 
+ bool checkPermission(const String16& permission, pid_t pid, uid_t uid)
+ {
++    return true;
+     sp<IPermissionController> pc;
+     gDefaultServiceManagerLock.lock();
+     pc = gPermissionController;
+-- 
+2.7.4
+
