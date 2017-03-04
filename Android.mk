@@ -18,7 +18,12 @@ LOCAL_PATH:= $(call my-dir)
 
 .PHONY: luneos-hybris-hal luneos-hybris-common
 
-luneos-hybris-common: bootimage servicemanager logcat updater init adb adbd linker libc libEGL libGLESv1_CM libGLESv2
+luneos-hybris-common: bootimage \
+                      servicemanager \
+		      logcat updater init adb adbd linker \
+		      libc \
+		      libEGL libGLESv1_CM libGLESv2 \
+		      libcamera_compat_layer camera_service libis_compat_layer
 
 ifeq ("$(TARGET_ARCH)", "arm64")
 luneos-hybris-hal: luneos-hybris-common linker_32 libc_32 libEGL_32 libGLESv1_CM_32 libGLESv2_32
