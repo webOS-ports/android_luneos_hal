@@ -15,35 +15,57 @@
 #
 
 LOCAL_PATH := $(call my-dir)
-ARCHIVE_NAME := hal-droid-wop-$(TARGET_DEVICE).tar
-ARCHIVE_NAME_COMPRESSED := hal-droid-wop-$(TARGET_DEVICE).tar.bz2
 
-.PHONY: luneos-hybris-hal luneos-hybris-common luneos-hybris-camera
+#---------------------------------------------------------------
+include $(CLEAR_VARS)
+LOCAL_MODULE := luneos-hybris-camera
+LOCAL_MODULE_CLASS := ROOT
+LOCAL_MODULE_SUFFIX := .tar
+LOCAL_MODULE_PATH := $(PRODUCT_OUT)
 
-luneos-hybris-camera: luneos-hybris-common libcamera_compat_layer libis_compat_layer camera_service
-	# Deploy only the needed libs for camera
-	@mkdir -p $(PRODUCT_OUT)/overlay-libs && chmod 755 $(PRODUCT_OUT)/overlay-libs
-	@( cd $(PRODUCT_OUT) ; cp -v system/lib/{liblog.so,libcameraservice.so,libcamera_client.so,libmedia.so,libmediaplayerservice.so,libstagefright.so,libcamera_compat_layer.so,libmedia_compat_layer.so,libis_compat_layer.so} overlay-libs/ )
-	@( cd $(PRODUCT_OUT) ; bunzip2 $(ARCHIVE_NAME_COMPRESSED); tar rvf $(ARCHIVE_NAME) overlay-libs/ system/bin/camera_service system/lib/libcamera_compat_layer.so system/lib/libmedia_compat_layer.so system/lib/libis_compat_layer.so ; bzip2 $(ARCHIVE_NAME) )
+include $(BUILD_SYSTEM)/base_rules.mk
 
-luneos-hybris-preliminary-cleanup:
-	# Cleanup generated libs and symbols
-	@rm -rf $(PRODUCT_OUT)/system/ $(PRODUCT_OUT)/symbols/
+$(LOCAL_BUILT_MODULE): libcamera_compat_layer libis_compat_layer camera_service
+	@echo "Deploy needed libs for camera_service in $(dir $@)."
+	@mkdir -p $(dir $@)
+	@rm -rf $@
+	mkdir -p $(dir $@)/overlay-libs && chmod 755 $(dir $@)/overlay-libs
+	cp $(PRODUCT_OUT)/system/lib/{liblog.so,libcameraservice.so,libcamera_client.so,libmedia.so,libmediaplayerservice.so,libstagefright.so,libcamera_compat_layer.so,libmedia_compat_layer.so,libis_compat_layer.so} $(dir $@)/overlay-libs/
+	mkdir -p $(dir $@)/system/bin && chmod -R 755 $(dir $@)/system
+	cp $(PRODUCT_OUT)/system/bin/camera_service $(dir $@)/system/bin/camera_service 
+	(cd $(dir $@) ; tar cvf $@ overlay-libs/ system/bin/camera_service )
 
-luneos-hybris-common: luneos-hybris-preliminary-cleanup \
-		      bootimage \
+#---------------------------------------------------------------
+
+ifeq ("$(TARGET_ARCH)", "arm64")
+luneos-hybris-common: ramdisk \
 		      servicemanager \
 		      logcat updater init adb adbd linker \
 		      libc \
 		      libEGL libGLESv1_CM libGLESv2 \
-	# Pack together all the system stuff we need and deploy the target into a tar.bz2 archive
-	@( cd $(PRODUCT_OUT) ; cp `find obj -name filesystem_config.txt` $(PRODUCT_OUT) || touch filesystem_config.txt )
-	@( cd $(PRODUCT_OUT) ; cp ramdisk.img android-ramdisk.img )
-	@( cd $(PRODUCT_OUT) ; tar cvjf $(ARCHIVE_NAME_COMPRESSED) system symbols android-ramdisk.img filesystem_config.txt )
-
-ifeq ("$(TARGET_ARCH)", "arm64")
-luneos-hybris-hal: luneos-hybris-common luneos-hybris-camera linker_32 libc_32 libEGL_32 libGLESv1_CM_32 libGLESv2_32
+		      linker_32 libc_32 libEGL_32 libGLESv1_CM_32 libGLESv2_32
 else
-luneos-hybris-hal: luneos-hybris-common luneos-hybris-camera
+luneos-hybris-common: ramdisk \
+		      servicemanager \
+		      logcat updater init adb adbd linker \
+		      libc \
+		      libEGL libGLESv1_CM libGLESv2
 endif
+
+#---------------------------------------------------------------
+include $(CLEAR_VARS)
+LOCAL_MODULE := luneos-hybris-hal
+LOCAL_MODULE_CLASS := ROOT
+LOCAL_MODULE_SUFFIX := .tar
+LOCAL_MODULE_PATH := $(PRODUCT_OUT)
+
+include $(BUILD_SYSTEM)/base_rules.mk
+
+$(LOCAL_BUILT_MODULE): luneos-hybris-common
+	@echo "Pack together all bionic-dependant binaries we need into $@"
+	@mkdir -p $(dir $@)
+	@rm -rf $@
+	cp `find $(PRODUCT_OUT)/obj -name filesystem_config.txt` $(PRODUCT_OUT) || touch $(PRODUCT_OUT)/filesystem_config.txt
+	cp $(PRODUCT_OUT)/ramdisk.img $(PRODUCT_OUT)/android-ramdisk.img
+	@( cd $(PRODUCT_OUT) ; tar cvf $@ system symbols android-ramdisk.img filesystem_config.txt )
 
