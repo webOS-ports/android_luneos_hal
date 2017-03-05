@@ -30,7 +30,7 @@ $(LOCAL_BUILT_MODULE): libcamera_compat_layer libis_compat_layer camera_service
 	@mkdir -p $(dir $@)
 	@rm -rf $@
 	mkdir -p $(dir $@)/overlay-libs && chmod 755 $(dir $@)/overlay-libs
-	cp $(PRODUCT_OUT)/system/lib/{liblog.so,libcameraservice.so,libcamera_client.so,libmedia.so,libmediaplayerservice.so,libstagefright.so,libcamera_compat_layer.so,libmedia_compat_layer.so,libis_compat_layer.so} $(dir $@)/overlay-libs/
+	cp $(PRODUCT_OUT)/system/lib/{liblog.so,libcameraservice.so,libcamera_client.so,libgui.so,libbinder.so,libmedia.so,libmediaplayerservice.so,libstagefright.so,libcamera_compat_layer.so,libmedia_compat_layer.so,libis_compat_layer.so} $(dir $@)/overlay-libs/
 	mkdir -p $(dir $@)/system/bin && chmod -R 755 $(dir $@)/system
 	cp $(PRODUCT_OUT)/system/bin/camera_service $(dir $@)/system/bin/camera_service 
 	(cd $(dir $@) ; tar cvf $@ overlay-libs/ system/bin/camera_service )
