@@ -1,0 +1,112 @@
+From be2d781571443ba387eb2741cf2398cc7fb1ab05 Mon Sep 17 00:00:00 2001
+From: Ivan Semkin <ivan@semkin.ru>
+Date: Thu, 1 Mar 2018 21:42:04 +0300
+Subject: [PATCH] Drop APKs
+
+---
+ pme/Android.mk | 86 +++++++++++++++++++++++++++++-----------------------------
+ 1 file changed, 43 insertions(+), 43 deletions(-)
+
+diff --git a/pme/Android.mk b/pme/Android.mk
+index ebda6f58..51a9db44 100644
+--- a/pme/Android.mk
++++ b/pme/Android.mk
+@@ -89,52 +89,52 @@ LOCAL_MODULE_SUFFIX := .so
+ LOCAL_PROPRIETARY_MODULE := true
+ include $(BUILD_PREBUILT)
+ 
+-include $(CLEAR_VARS)
+-LOCAL_MODULE := TimeService
+-LOCAL_MODULE_OWNER := htc
+-LOCAL_SRC_FILES := proprietary/app/TimeService/TimeService.apk
+-LOCAL_CERTIFICATE := platform
+-LOCAL_MODULE_TAGS := optional
+-LOCAL_MODULE_CLASS := APPS
+-LOCAL_DEX_PREOPT := false
+-LOCAL_MODULE_SUFFIX := .apk
+-include $(BUILD_PREBUILT)
++#include $(CLEAR_VARS)
++#LOCAL_MODULE := TimeService
++#LOCAL_MODULE_OWNER := htc
++#LOCAL_SRC_FILES := proprietary/app/TimeService/TimeService.apk
++#LOCAL_CERTIFICATE := platform
++#LOCAL_MODULE_TAGS := optional
++#LOCAL_MODULE_CLASS := APPS
++#LOCAL_DEX_PREOPT := false
++#LOCAL_MODULE_SUFFIX := .apk
++#include $(BUILD_PREBUILT)
+ 
+-include $(CLEAR_VARS)
+-LOCAL_MODULE := CNEService
+-LOCAL_MODULE_OWNER := htc
+-LOCAL_SRC_FILES := proprietary/priv-app/CNEService/CNEService.apk
+-LOCAL_CERTIFICATE := platform
+-LOCAL_MODULE_TAGS := optional
+-LOCAL_MODULE_CLASS := APPS
+-LOCAL_DEX_PREOPT := false
+-LOCAL_MODULE_SUFFIX := .apk
+-LOCAL_PRIVILEGED_MODULE := true
+-include $(BUILD_PREBUILT)
++#include $(CLEAR_VARS)
++#LOCAL_MODULE := CNEService
++#LOCAL_MODULE_OWNER := htc
++#LOCAL_SRC_FILES := proprietary/priv-app/CNEService/CNEService.apk
++#LOCAL_CERTIFICATE := platform
++#LOCAL_MODULE_TAGS := optional
++#LOCAL_MODULE_CLASS := APPS
++#LOCAL_DEX_PREOPT := false
++#LOCAL_MODULE_SUFFIX := .apk
++#LOCAL_PRIVILEGED_MODULE := true
++#include $(BUILD_PREBUILT)
+ 
+-include $(CLEAR_VARS)
+-LOCAL_MODULE := QtiTetherService
+-LOCAL_MODULE_OWNER := htc
+-LOCAL_SRC_FILES := proprietary/priv-app/QtiTetherService/QtiTetherService.apk
+-LOCAL_CERTIFICATE := platform
+-LOCAL_MODULE_TAGS := optional
+-LOCAL_MODULE_CLASS := APPS
+-LOCAL_DEX_PREOPT := false
+-LOCAL_MODULE_SUFFIX := .apk
+-LOCAL_PRIVILEGED_MODULE := true
+-include $(BUILD_PREBUILT)
++#include $(CLEAR_VARS)
++#LOCAL_MODULE := QtiTetherService
++#LOCAL_MODULE_OWNER := htc
++#LOCAL_SRC_FILES := proprietary/priv-app/QtiTetherService/QtiTetherService.apk
++#LOCAL_CERTIFICATE := platform
++#LOCAL_MODULE_TAGS := optional
++#LOCAL_MODULE_CLASS := APPS
++#LOCAL_DEX_PREOPT := false
++#LOCAL_MODULE_SUFFIX := .apk
++#LOCAL_PRIVILEGED_MODULE := true
++#include $(BUILD_PREBUILT)
+ 
+-include $(CLEAR_VARS)
+-LOCAL_MODULE := com.qualcomm.location
+-LOCAL_MODULE_OWNER := htc
+-LOCAL_SRC_FILES := proprietary/priv-app/com.qualcomm.location/com.qualcomm.location.apk
+-LOCAL_CERTIFICATE := platform
+-LOCAL_MODULE_TAGS := optional
+-LOCAL_MODULE_CLASS := APPS
+-LOCAL_DEX_PREOPT := false
+-LOCAL_MODULE_SUFFIX := .apk
+-LOCAL_PRIVILEGED_MODULE := true
+-include $(BUILD_PREBUILT)
++#include $(CLEAR_VARS)
++#LOCAL_MODULE := com.qualcomm.location
++#LOCAL_MODULE_OWNER := htc
++#LOCAL_SRC_FILES := proprietary/priv-app/com.qualcomm.location/com.qualcomm.location.apk
++#LOCAL_CERTIFICATE := platform
++#LOCAL_MODULE_TAGS := optional
++#LOCAL_MODULE_CLASS := APPS
++#LOCAL_DEX_PREOPT := false
++#LOCAL_MODULE_SUFFIX := .apk
++#LOCAL_PRIVILEGED_MODULE := true
++#include $(BUILD_PREBUILT)
+ 
+ 
+ endif
+-- 
+2.16.2
+
